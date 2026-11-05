@@ -1,0 +1,416 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>弹幕雷达 · 斗鱼弹幕统计</title>
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='13' fill='%234de0b0'/></svg>">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="dot"></span>
+    <h1>弹幕雷达</h1>
+    <span class="sub">斗鱼直播间弹幕统计</span>
+  </div>
+
+  <nav class="tabs" id="tabs">
+    <button data-tab="live" class="active">实时弹幕</button>
+    <button data-tab="search">关键词检索</button>
+    <button data-tab="user">用户</button>
+    <button data-tab="board">排行榜</button>
+    <button data-tab="timeline">时间线</button>
+    <button data-tab="favorites">收藏夹</button>
+    <button data-tab="settings">设置</button>
+  </nav>
+
+  <div class="conn" id="conn">
+    <button class="ui-hint" id="ui-hint" type="button" hidden></button>
+    <span class="conn-dot" id="conn-dot"></span>
+    <span id="conn-text">连接中…</span>
+  </div>
+</header>
+
+<div class="statbar">
+  <div class="stat"><b id="stat-today">0</b><span>今日弹幕</span></div>
+  <div class="stat"><b id="stat-total">0</b><span>累计弹幕</span></div>
+  <div class="stat"><b id="stat-users">0</b><span>用户数</span></div>
+  <div class="stat"><b id="stat-rooms">0</b><span>在采房间</span></div>
+  <div class="stat wide"><b id="stat-db">—</b><span>数据库</span></div>
+</div>
+
+<main>
+  <!-- ============ 实时 ============ -->
+  <section class="tab-panel active" id="tab-live">
+    <aside class="rooms">
+      <div class="panel-head">
+        <h2>房间</h2>
+        <span class="muted" id="room-count">0</span>
+      </div>
+      <div class="room-add">
+        <input id="room-add-input" placeholder="房间号 / 直播间链接" autocomplete="off">
+        <button id="room-add-btn" class="btn primary">添加</button>
+      </div>
+      <div class="room-list" id="room-list"></div>
+      <div class="panel-head burst-head">
+        <h2>弹幕潮</h2>
+        <span class="muted" id="burst-count">0</span>
+      </div>
+      <div class="burst-list" id="burst-list">
+        <p class="hint" id="burst-empty">最近 3 小时还没有被多人复读的句子。</p>
+      </div>
+      <p class="hint">10 秒内同一句话被 3 个以上不同用户刷出，算一次弹幕潮；被去重层拦下的连发会另存一份，不会丢。</p>
+    </aside>
+
+    <div class="stream-wrap">
+      <div class="stream-head">
+        <h2 id="live-rid-label">实时弹幕</h2>
+        <div class="stream-tools">
+          <input id="live-filter" class="mini-input" placeholder="页面内筛选…" autocomplete="off">
+          <label class="switch"><input type="checkbox" id="live-pause"> 暂停滚动</label>
+          <button class="btn ghost" id="live-clear">清屏</button>
+        </div>
+      </div>
+      <div class="stream" id="live-list">
+        <div class="empty" id="live-empty">
+          <p class="big">还没有弹幕</p>
+          <p>在左侧添加一个斗鱼直播间，弹幕会实时出现在这里。</p>
+        </div>
+      </div>
+      <button class="jump" id="live-jump" title="回到最新一条">↓ 回到最新</button>
+      <div class="stream-foot">
+        <span id="live-count">0 条</span>
+        <span id="live-speed" class="muted">—</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 检索 ============ -->
+  <section class="tab-panel" id="tab-search">
+    <div class="search-box">
+      <div class="search-row">
+        <input id="q" placeholder="输入关键词，例如：抽奖 / 开团 / 主播名字" autocomplete="off">
+        <button id="s-btn" class="btn primary">检索</button>
+      </div>
+      <div class="search-opts">
+        <label class="switch"><input type="checkbox" id="s-syn" checked> 同义词 / 梗词扩展</label>
+        <label class="switch"><input type="checkbox" id="s-cooc" checked> 强相关（上下文共现挖掘）</label>
+        <select id="s-rid" class="select"><option value="">全部房间</option></select>
+        <select id="s-range" class="select">
+          <option value="">全部时间</option>
+          <option value="1h">最近 1 小时</option>
+          <option value="today">今天</option>
+          <option value="7d">最近 7 天</option>
+          <option value="30d">最近 30 天</option>
+        </select>
+        <button class="btn ghost" id="s-export">导出 CSV</button>
+      </div>
+      <div class="examples" id="s-keywords">
+        <span class="muted">正在统计高频词…</span>
+      </div>
+    </div>
+
+    <div class="search-summary" id="s-summary"></div>
+    <div class="results" id="s-results">
+      <div class="empty">
+        <p class="big">按关键词召回弹幕</p>
+        <p>三路召回：精确命中 → 同义/梗词扩展 → 上下文中「强相关」的词，每条结果都标注命中原因。</p>
+        <p class="muted small">注意：斗鱼没有公开历史弹幕接口，可检索的只有本工具运行期间采集到的数据。</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 用户 ============ -->
+  <section class="tab-panel" id="tab-user">
+    <div class="user-layout">
+      <aside class="follows">
+        <div class="panel-head">
+          <button class="fold-btn" id="fold-special" title="折叠 / 展开特别关注" aria-expanded="true">▾</button>
+          <h2>特别关注</h2>
+          <span class="muted" id="follow-special-count">0</span>
+        </div>
+        <div class="follow-list" id="follow-special-list"></div>
+
+        <div class="panel-head">
+          <button class="fold-btn" id="fold-normal" title="折叠 / 展开其他关注" aria-expanded="true">▾</button>
+          <h2>其他关注</h2>
+          <span class="muted" id="follow-count">0</span>
+        </div>
+        <input id="follow-search" class="text-input" placeholder="UID 或昵称，回车直接看" autocomplete="off">
+        <div class="follow-list" id="follow-list"></div>
+        <p class="hint">
+          点名字直接看 TA 的页面；每行右侧可以取消特别关注，或者直接取消关注。
+          <br>关注只是本地的一张表，不上传任何地方。
+        </p>
+      </aside>
+
+      <div class="user-main">
+        <div class="search-box">
+          <div class="search-row">
+            <input id="uid" placeholder="输入用户 UID 或昵称，例如：25332273" autocomplete="off">
+            <button id="u-btn" class="btn primary">分析</button>
+          </div>
+          <div class="examples" id="u-suggest"></div>
+        </div>
+        <div id="u-result" class="profile">
+          <div class="empty">
+            <p class="big">输入一个 UID，看 TA 在这个直播间说过什么</p>
+            <p>基于 TA 在本机采到的全部弹幕，给出行为特征、历史分布和可回溯的证据句。</p>
+            <p class="muted small">这里输出的是<strong>基于发言的行为归纳，不是身份判定</strong>。数据只覆盖本工具运行期间；样本太少的用户会明确标注「样本偏少」。</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 排行榜 ============ -->
+  <section class="tab-panel" id="tab-board">
+    <div class="search-box">
+      <div class="search-row">
+        <select id="b-rid" class="select"><option value="">全部房间</option></select>
+        <div class="seg" id="b-range">
+          <button data-range="today" class="active">今天</button>
+          <button data-range="1">选日期</button>
+          <button data-range="0">全部</button>
+        </div>
+        <input id="b-date" class="text-input" type="date" style="flex:0 1 150px;min-width:130px;max-width:150px">
+        <select id="b-limit" class="select">
+          <option value="100">前 100</option>
+          <option value="50">前 50</option>
+          <option value="20">前 20</option>
+        </select>
+        <button id="b-btn" class="btn primary">刷新</button>
+      </div>
+      <p class="hint muted small" id="b-note">「被 +1」指同一种说法的第二条及以后：一条「哈哈」首发不算，后面每跟一条算一次 +1。</p>
+    </div>
+    <div class="grid2">
+      <div class="card">
+        <h3>发言榜 <span class="muted small" id="b-users-meta"></span></h3>
+        <ol class="board" id="b-users">
+          <li class="empty small">还没有数据</li>
+        </ol>
+      </div>
+      <div class="card">
+        <h3>被 +1 最多的弹幕 <span class="muted small" id="b-phrases-meta"></span></h3>
+        <ol class="board" id="b-phrases">
+          <li class="empty small">还没有数据</li>
+        </ol>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 时间线 ============ -->
+  <section class="tab-panel" id="tab-timeline">
+    <div class="search-box">
+      <div class="search-row">
+        <input id="t-date" class="select" type="date" />
+        <select id="t-rid" class="select"><option value="">全部房间</option></select>
+        <label class="switch"><input type="checkbox" id="t-min2" checked> 只看出现 ≥2 次的</label>
+        <button class="btn ghost" id="t-clear">清除选区</button>
+        <button class="btn ghost" id="t-refresh">刷新</button>
+      </div>
+      <p class="hint muted small" id="t-hint">在时间线上按住鼠标拖出一段；选好后会固定住，拖两端可以微调，点「清除选区」或按 Esc 取消。</p>
+    </div>
+
+    <div class="card tl-card">
+      <div class="tl-head">
+        <div class="tl-readout" id="t-readout">还没有选择时间范围</div>
+        <div class="tl-legend muted small">每根柱子 = 1 分钟内的弹幕条数</div>
+      </div>
+      <div class="tl-wrap">
+        <canvas id="t-canvas" height="150"></canvas>
+      </div>
+      <div class="tl-axis" id="t-axis"></div>
+    </div>
+
+    <div class="search-summary" id="t-summary"></div>
+    <div class="results" id="t-results">
+      <div class="empty">
+        <p class="big">按时间看弹幕在说什么</p>
+        <p>选出一天的某一段，按「重复次数」从多到少列出这段时间里出现过的说法。</p>
+        <p class="muted small">排序是重复次数，所以整场只说过一次的话会排在最后（可用上面的开关过滤）。</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 收藏夹 ============ -->
+  <section class="tab-panel" id="tab-favorites">
+    <div class="card">
+      <div class="row-inline" style="margin-top:0">
+        <select id="f-rid" class="select"></select>
+        <button class="btn ghost" id="f-refresh">刷新</button>
+        <span class="hint" id="f-count"></span>
+      </div>
+      <p class="hint" style="margin-top:8px">
+        收藏的是「说法」，不是某一条。点说法直接去检索；后面的条数/人数是<strong>现在</strong>的数，会随采集变化。
+      </p>
+    </div>
+    <div id="f-list" class="fav-list"></div>
+  </section>
+
+  <!-- ============ 设置 ============ -->
+  <section class="tab-panel" id="tab-settings">
+    <div class="grid2">
+      <div class="card span2">
+        <h2>界面与退出</h2>
+        <p class="hint" style="margin-top:-4px">
+          数据完全一样，只是外壳不同：独立窗口没有地址栏和标签页，任务栏里是自己的图标；浏览器标签就是你平时用的那个网页。
+        </p>
+        <div class="row-inline">
+          <label class="switch"><input type="radio" name="winmode" id="ui-mode-app" value="app"> 独立窗口</label>
+          <label class="switch"><input type="radio" name="winmode" id="ui-mode-browser" value="browser"> 浏览器标签</label>
+          <span class="hint">独立窗口需要电脑上有 Edge 或 Chrome</span>
+        </div>
+        <div class="row-inline">
+          <label>关窗口时</label>
+          <label class="switch"><input type="radio" name="closeact" id="ui-close-tray" value="tray"> 缩小到系统托盘</label>
+          <label class="switch"><input type="radio" name="closeact" id="ui-close-stop" value="stop"> 停止采集</label>
+          <label>宽限</label>
+          <input id="ui-grace" class="mini-input" type="number" min="5" max="600" value="30">
+          <span>秒</span>
+        </div>
+        <p class="hint">
+          <strong>缩小到系统托盘</strong>：界面关掉、采集继续，任务栏右下角留一个图标（双击回来，右键退出）。
+          <strong>停止采集</strong>：界面关掉后先等<strong>宽限期</strong>再停，这段时间重新打开页面就继续。
+        </p>
+        <div class="row-inline">
+          <button class="btn primary" id="ui-save">保存</button>
+          <button class="btn ghost" id="ui-open">现在开独立窗口</button>
+          <button class="btn ghost" id="ui-open-tab">现在开启浏览器窗口</button>
+          <button class="btn danger" id="set-shutdown">停止采集并退出</button>
+          <span class="hint" id="ui-status"></span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>数据</h2>
+        <dl class="kv" id="set-info"></dl>
+        <div class="row-inline">
+          <label>保留最近</label>
+          <input id="set-retention" class="mini-input" type="number" min="1" max="3650" value="90">
+          <span>天</span>
+          <label class="switch"><input type="checkbox" id="set-forever"> 永久保留</label>
+          <button class="btn" id="set-prune">立即清理</button>
+        </div>
+        <p class="hint" id="set-retention-hint">清理会永久删除更早的弹幕，无法恢复。默认保留 90 天。</p>
+      </div>
+
+      <div class="card">
+        <h2>房间管理</h2>
+        <div class="room-list" id="set-rooms"></div>
+        <p class="hint">删除房间会同时停止采集；勾选「同时删除已采集数据」会一并清理该房间的弹幕。</p>
+      </div>
+
+      <div class="card span2">
+        <h2>弹幕库分发</h2>
+        <p class="hint" style="margin-top:-4px">
+          导出的是一个独立的 <code>.db</code> 文件（SQLite），用任何数据库工具都能打开检查；
+          别人在「导入」里选中它，语料就并进来了。同一条弹幕按内容指纹去重，重复导入不会翻倍。
+        </p>
+        <div class="row-inline">
+          <label>范围</label>
+          <select id="lib-rid" class="select"></select>
+          <select id="lib-range" class="select">
+            <option value="all">全部时间</option>
+            <option value="today">今天</option>
+            <option value="7">最近 7 天</option>
+            <option value="30">最近 30 天</option>
+          </select>
+          <label class="switch"><input type="checkbox" id="lib-anon" checked> 匿名导出（推荐）</label>
+          <button class="btn primary" id="lib-export">导出库包</button>
+          <span class="hint" id="lib-export-status"></span>
+        </div>
+        <p class="hint" id="lib-anon-note">
+          <strong>匿名库包</strong>里没有 <strong>UID</strong> 也没有<strong>昵称</strong>：每条弹幕的 uid 写成 0、昵称写成「匿名」，
+          只保留正文、时间、房间和计数。所以它可以公开分给别人。
+        </p>
+        <p class="hint warn" id="lib-warn" hidden>
+          ⚠️ 取消匿名会带上 UID 和昵称。这样的包只建议在自己设备之间同步，不要公开分发。
+        </p>
+        <div class="row-inline">
+          <input id="lib-file" type="file" accept=".db,.sqlite,.sqlite3,application/vnd.sqlite3" class="text-input">
+          <button class="btn" id="lib-import">导入库包</button>
+          <span class="hint" id="lib-status"></span>
+        </div>
+      </div>
+
+      <div class="card span2">
+        <h2>口癖前后缀折叠</h2>
+        <p class="hint" style="margin-top:-4px">
+          勾上之后，带这些前后缀的弹幕会并到同一句话里——「绝不认输desuwa」和「绝不认输」算一条，
+          「被 +1」才统计得出来。你可以勾常用项，也可以自己输入。
+        </p>
+        <div class="affix-row">
+          <span class="affix-label">常用后缀</span>
+          <div class="chips" id="affix-preset-suffixes"></div>
+        </div>
+        <div class="affix-row">
+          <span class="affix-label">常用前缀</span>
+          <div class="chips" id="affix-preset-prefixes"></div>
+        </div>
+        <div class="affix-row">
+          <span class="affix-label">自己加</span>
+          <input id="affix-input" class="mini-input" type="text" placeholder="例如 desuwa / 喵 / 草" maxlength="24">
+          <select id="affix-side" class="select">
+            <option value="suffixes">作为后缀</option>
+            <option value="prefixes">作为前缀</option>
+          </select>
+          <button class="btn ghost" id="affix-add">添加</button>
+        </div>
+        <div class="affix-row">
+          <span class="affix-label">已启用</span>
+          <div class="chips" id="affix-active"></div>
+        </div>
+        <div class="row-inline">
+          <button class="btn primary" id="affix-save">保存并重算</button>
+          <span class="hint" id="affix-status"></span>
+        </div>
+      </div>
+
+      <div class="card span2">
+        <h2>录播弹幕导入</h2>
+        <p class="hint">
+          斗鱼没有历史弹幕接口，但视频站的录播有完整弹幕。粘贴任意
+          <code>v.douyu.com/show/…</code> 链接，就能把那一场的弹幕导入本地库，直接参与检索与行为特征。
+        </p>
+        <div class="row-inline">
+          <input id="vod-input" class="text-input" type="text"
+                 placeholder="https://v.douyu.com/show/6Aw87Ogqmxj7YGkg 或直接填 ID">
+          <button class="btn ghost" id="vod-preview">预览</button>
+          <button class="btn" id="vod-import">导入</button>
+        </div>
+        <p class="hint" id="vod-status"></p>
+        <div class="vod-done" id="vod-done"></div>
+      </div>
+
+      <div class="card">
+        <h2>自定义词表（可选）</h2>
+        <p class="hint">新建 <code>data\lexicon.json</code> 后重启程序即可生效：</p>
+        <pre class="code">{
+  "groups": [["上号", "开黑", "组队"]],
+  "ad": ["加V", "看我主页"],
+  "aggressive": ["摆烂"]
+}</pre>
+        <p class="hint"><code>groups</code> 里的词互相视为同义，用于检索扩展。</p>
+      </div>
+
+      <div class="card">
+        <h2>关于数据口径</h2>
+        <ul class="bullets">
+          <li>只采集斗鱼公开弹幕，全部存放在本机 <code>data\danmaku.db</code>。</li>
+          <li>斗鱼没有历史弹幕查询接口，所以「历史」= 本工具运行期间累积的数据。</li>
+          <li>会去重，但只挡「同一个人、同一毫秒、同一句话」——现实中只有断线重连的重复投递会这样。真刷两次（时间不同）仍算两条，这是统计活跃度的基础。</li>
+          <li>大房间约 30 条/秒，90 天约数 GB，请留意磁盘。</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+</main>
+
+<div class="toast" id="toast"></div>
+<script src="/copy.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

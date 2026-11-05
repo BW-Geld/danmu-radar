@@ -1,0 +1,19 @@
+# 数据与运行产物：绝对不进仓库
+data/
+dist/
+.shots/
+.archify/
+tools/sea-test/
+tools/probes/
+*.log
+
+# 导出的库包
+danmu-lib-*.db
+*.db
+*.db-wal
+*.db-shm
+
+# 系统垃圾
+Thumbs.db
+desktop.ini
+.DS_Store
