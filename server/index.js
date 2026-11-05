@@ -220,6 +220,11 @@ const clients = new Set();
 let uiAttached = false;
 let graceSince = 0;
 let appWindowChild = null;
+// 我们主动关掉的旧窗口 pid：它的 exit 回调不能当成「用户关窗」
+let closingAppWindowPid = 0;
+// 正在通过接口拉界面：这期间浏览器早退（转交给旧实例、启动失败）不算用户关窗，
+// 也别在 exit 回调里再补开一个，否则一次点击会开出两个窗口。
+let openingUi = false;
 
 /** 在采房间 + 只存在于数据库里的房间（如录播导入的占位房间） */
 function roomList() {
@@ -676,12 +681,30 @@ async function handleApi(req, res, url) {
     // 从「浏览器标签」切成「独立窗口」时，或者用户直接点了「现在开独立窗口」，立刻开一个
     let opened = false;
     if (body.open === true || body.openWindow === 'app' || (before.windowMode !== next.windowMode && next.windowMode === 'app')) {
-      opened = openAppWindow();
+      opened = await openAppWindow();
     } else if (body.openWindow === 'browser') {
       // 「现在开启浏览器窗口」：不管当前模式，直接用默认浏览器开一个标签页
       opened = await openBrowser({ noApp: true, force: true });
     }
     return json(res, 200, { ok: true, ...next, opened });
+  }
+
+  // 托盘图标点「打开界面」：优先把已经开着的窗口提到前台，没有才新开一个
+  if (p === '/ui/activate' && req.method === 'POST') {
+    const pid = activeAppPid();
+    if (pid && (await focusAppWindow(pid))) {
+      ensureTray();
+      return json(res, 200, { ok: true, how: 'focused' });
+    }
+    // 没有独立窗口，但可能已经在浏览器标签里开着（标题含「弹幕雷达」）：把它叫出来就行，
+    // 不要再启动一次浏览器——提权/普通权限混用时，再启动一次会弹 Windows 的「Edge 未响应」权限提示。
+    if (await focusAnyWindow()) {
+      ensureTray();
+      return json(res, 200, { ok: true, how: 'tab-focused' });
+    }
+    if (await openAppWindow()) return json(res, 200, { ok: true, how: 'app' });
+    const tab = await openBrowser({ noApp: true, force: true });
+    return json(res, 200, { ok: true, how: tab ? 'browser' : 'none' });
   }
 
   // 退出：缩到托盘，或者停止采集（界面上的两选一）
@@ -1113,20 +1136,40 @@ server.on('error', (err) => {
  *   3) explorer.exe url —— 最后一招，explorer 会交给默认浏览器。
  * 全部失败也不影响服务，只是要手动点控制台里打印的地址。
  */
-/** 找一个能开「应用窗口」的浏览器：Edge 优先，其次 Chrome */
-function appWindowBrowsers() {
-  const bases = [process.env['ProgramFiles(x86)'], process.env.ProgramFiles, 'C:\\Program Files (x86)', 'C:\\Program Files'];
+/**
+ * 能开「独立窗口」的浏览器，按顺序：Edge 在前，Chrome 兜底。
+ *
+ * 用户要求 Edge 优先（机器上平时用的就是 Edge，不想无端换浏览器）。
+ * 风险是：Windows 上只要有个「以管理员身份运行」的 Edge，普通权限再启动 Edge
+ * 就可能弹「现有实例正在以提升的权限运行」的权限框，或者留下一个标题停在
+ * `127.0.0.1_/`、页面永远不加载的白页。那个高权限实例既提不到前台
+ * （SetForegroundWindow 被跨权限挡住），也杀不掉（taskkill 拒绝访问）。
+ * 所以这里不假设 Edge 一定行：调用方会等「真有界面连上 SSE」，连不上就关掉
+ * 换下一个候选 —— Chrome 就是那个兜底。
+ */
+function browserCandidates() {
+  const bases = [
+    process.env['ProgramFiles(x86)'],
+    process.env.ProgramFiles,
+    process.env.LOCALAPPDATA,
+    'C:\\Program Files (x86)',
+    'C:\\Program Files',
+  ];
   const names = [
     'Microsoft\\Edge\\Application\\msedge.exe',
     'Google\\Chrome\\Application\\chrome.exe',
   ];
   const out = [];
+  const seen = new Set();
   for (const n of names) {
     for (const b of bases) {
       if (!b) continue;
       const p = path.join(b, n);
       try {
-        if (fs.existsSync(p)) out.push(p);
+        if (fs.existsSync(p) && !seen.has(p.toLowerCase())) {
+          seen.add(p.toLowerCase());
+          out.push(p);
+        }
       } catch {
         /* ignore */
       }
@@ -1135,10 +1178,23 @@ function appWindowBrowsers() {
   return out;
 }
 
+/** 浏览器类型：两家共用一份配置目录会互相踩，必须分开 */
+function browserName(exe) {
+  return /chrome\.exe$/i.test(exe) ? 'chrome' : 'edge';
+}
+
+/** 每种浏览器一份专属配置目录 */
+function profileFor(exe) {
+  return path.join(ROOT, 'data', browserName(exe) === 'chrome' ? 'chrome-profile' : 'window-profile');
+}
+
 // ---------------------------------------------------------------- 系统托盘
 // 关窗口选「缩到系统托盘」时，用 PowerShell 的 NotifyIcon 留在任务栏右下角。
 // 只用 Windows 自带的 WinForms，不装任何依赖。
 let trayChild = null;
+// 托盘只该有一个。启动脚本要几百毫秒才写完 pid 文件，这期间别的调用点再进来
+// 就会看到「还没起」，于是又拉一个——屏幕上就出现两个图标。这里自己记一笔。
+let trayStartedAt = 0;
 
 function trayPidFile() {
   return path.join(ROOT, 'data', 'tray.pid');
@@ -1157,6 +1213,9 @@ function trayAlive() {
 
 function ensureTray() {
   if (trayAlive()) return true;
+  // 刚拉过、pid 文件还没落盘的这段时间，直接当作已启动，避免重复拉
+  if (trayChild && !trayChild.killed) return true;
+  if (trayStartedAt && Date.now() - trayStartedAt < 10000) return true;
   if (process.platform !== 'win32') {
     console.log('[托盘] 目前只在 Windows 上支持缩到托盘');
     return false;
@@ -1181,10 +1240,14 @@ function ensureTray() {
       // 不能用 detached: DETACHED_PROCESS 下 PowerShell 5.1 会立刻退出（实测 exit 0、脚本一行没跑）
       { detached: false, stdio: 'ignore', windowsHide: true }
     );
-    p.on('error', (err) => console.log(`[托盘] 启动失败：${err.code || err.message}`));
+    p.on('error', (err) => {
+      trayStartedAt = 0;
+      console.log(`[托盘] 启动失败：${err.code || err.message}`);
+    });
     p.unref();
     trayChild = p;
-    console.log('[托盘] 已缩到系统托盘，采集继续（双击图标回到界面，右键可退出）');
+    trayStartedAt = Date.now();
+    console.log('[托盘] 托盘图标已就绪（双击回到界面，右键可退出）');
     return true;
   } catch (err) {
     console.log(`[托盘] 启动失败：${err.message}`);
@@ -1213,78 +1276,369 @@ function stopTray() {
   trayChild = null;
 }
 
-/** 用 --app 开一个没有地址栏/标签页的独立窗口，像桌面软件 */
-function openAppWindow() {
-  if (DRY_RUN) {
-    console.log('[界面] [dry] 会打开独立窗口');
-    return true;
-  }
-  const { spawn } = require('node:child_process');
-  const url = `http://${HOST}:${PORT}/`;
-  const profile = path.join(ROOT, 'data', 'window-profile');
+/**
+ * 独立窗口的 pid 记录。
+ * Edge / Chrome 对同一个 --user-data-dir 只允许一个实例：已经有一个窗口在跑时再 spawn，
+ * 新进程会把参数转交给旧进程、自己立刻退出，屏幕上多出一个停在 127.0.0.1/ 的白页。
+ * 所以这里记下 pid，开新窗口之前先把旧的关掉。
+ */
+function appWindowPidFile() {
+  return path.join(ROOT, 'data', 'app-window.pid');
+}
+
+/** 窗口的完整记录：pid + 哪个浏览器 + 用的哪份配置目录（清理残留进程要按目录找） */
+function appWindowStateFile() {
+  return path.join(ROOT, 'data', 'app-window.json');
+}
+
+function pidAlive(pid) {
+  if (!pid) return false;
   try {
-    fs.mkdirSync(profile, { recursive: true });
-  } catch {
-    /* ignore */
-  }
-  const exe = appWindowBrowsers()[0];
-  if (!exe) {
-    console.log('[界面] 没找到 Edge / Chrome，无法打开独立窗口');
-    return false;
-  }
-  try {
-    const p = spawn(
-      exe,
-      [
-        `--app=${url}`,
-        `--user-data-dir=${profile}`,
-        '--window-size=1500,940',
-        '--no-first-run',
-        '--no-default-browser-check',
-        '--disable-features=Translate,MediaRouter',
-      ],
-      { detached: true, stdio: 'ignore', windowsHide: false }
-    );
-    p.on('error', (err) => {
-      console.log(`[界面] 打开独立窗口失败：${err.code || err.message}（${exe}）`);
-    });
-    p.on('spawn', () => console.log(`[界面] 已打开独立窗口（${path.basename(exe)}）`));
-    p.unref();
-    appWindowChild = p;
-    const startedAt = Date.now();
-    p.on('exit', (code) => {
-      const lived = Date.now() - startedAt;
-      appWindowChild = null;
-      // 刚起来就退：多半是浏览器把请求转给了同 profile 的旧进程，或直接报错。
-      // 这时不能当成「用户关了窗口」，退回到普通标签页，至少让用户看到界面。
-      if (lived < 5000) {
-        if (clients.size > 0) return;
-        console.log(`\n[界面] 独立窗口没能起来（${lived}ms 后退出，code=${code}），改用浏览器标签打开。`);
-        openBrowser({ noApp: true });
-        return;
-      }
-      // 还有别的界面连着（比如浏览器标签还开着），就不算「关掉程序」
-      if (clients.size > 0) {
-        console.log('\n[界面] 独立窗口已关闭，但还有别的界面在用，继续采集。');
-        return;
-      }
-      const ui = getUISettings();
-      if (ui.closeAction === 'tray') {
-        console.log('\n[界面] 窗口已关闭，按设置缩到系统托盘。');
-        ensureTray();
-        return;
-      }
-      if (!ui.stopOnWindowClose) return;
-      console.log('\n[界面] 独立窗口已关闭 → 按设置停止采集。');
-      shutdown('窗口关闭');
-    });
+    process.kill(pid, 0);
     return true;
   } catch {
     return false;
   }
 }
 
+/** 读窗口记录；旧版本只写了 pid 文件，也认 */
+function readAppWindowState() {
+  let st = {};
+  try {
+    st = JSON.parse(fs.readFileSync(appWindowStateFile(), 'utf8')) || {};
+  } catch {
+    /* 旧版本 */
+  }
+  let pid = Number(st.pid) || 0;
+  if (!pid) {
+    try {
+      pid = Number(fs.readFileSync(appWindowPidFile(), 'utf8').trim()) || 0;
+    } catch {
+      pid = 0;
+    }
+  }
+  return { pid, exe: st.exe || '', profile: st.profile || '' };
+}
+
+function writeAppWindowState(pid, exe, profile) {
+  try {
+    fs.writeFileSync(appWindowPidFile(), String(pid));
+  } catch {
+    /* ignore */
+  }
+  try {
+    fs.writeFileSync(appWindowStateFile(), JSON.stringify({ pid, exe, profile }));
+  } catch {
+    /* ignore */
+  }
+}
+
+/** 清记录；传了 onlyPid 就只在记录的仍是这个 pid 时清（别把新窗口的记录抹掉） */
+function clearAppWindowState(onlyPid) {
+  if (onlyPid) {
+    const st = readAppWindowState();
+    if (st.pid && st.pid !== onlyPid) return;
+  }
+  for (const f of [appWindowPidFile(), appWindowStateFile()]) {
+    try {
+      fs.unlinkSync(f);
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+/** 记着的那扇独立窗口还活着就返回它的 pid，否则 0 */
+function activeAppPid() {
+  const st = readAppWindowState();
+  return pidAlive(st.pid) ? st.pid : 0;
+}
+
+/** 按窗口标题找「弹幕雷达」的窗口并提到前台（不限 pid：浏览器标签页也算） */
+function focusAnyWindow() {
+  return new Promise((resolve) => {
+    const script = path.join(ROOT, 'tools', 'focus.ps1');
+    if (!fs.existsSync(script)) return resolve(false);
+    const { execFile } = require('node:child_process');
+    execFile(
+      'powershell.exe',
+      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script, '-Title', '弹幕雷达'],
+      { timeout: 12000 },
+      (err, stdout) => resolve(!err && String(stdout).includes('FOCUSED'))
+    );
+  });
+}
+
+/**
+ * 把已经开着的窗口提到最前面。
+ * 先按「窗口标题含 弹幕雷达」找（tools/focus.ps1，SetForegroundWindow）——
+ * 白页窗口的标题是 `127.0.0.1_/`，匹配不到，正好被当成「不是好窗口」；
+ * 再退回按 pid 的 AppActivate 兜底。返回是否真的提到了。
+ */
+function focusAppWindow(pid) {
+  if (!pidAlive(pid)) return Promise.resolve(false);
+  const { execFile } = require('node:child_process');
+  const script = path.join(ROOT, 'tools', 'focus.ps1');
+  const byTitle = new Promise((resolve) => {
+    if (!fs.existsSync(script)) return resolve(false);
+    execFile(
+      'powershell.exe',
+      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script, '-TargetPid', String(pid), '-Title', '弹幕雷达'],
+      { timeout: 12000 },
+      (err, stdout) => resolve(!err && String(stdout).includes('FOCUSED'))
+    );
+  });
+  const byPid = () => new Promise((resolve) => {
+    const ps = `$s = New-Object -ComObject WScript.Shell; if ($s.AppActivate(${pid})) { 'FOCUSED' } else { 'MISSED' }`;
+    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { timeout: 6000 }, (err, stdout) => {
+      resolve(!err && String(stdout).includes('FOCUSED'));
+    });
+  });
+  return byTitle.then((ok) => (ok ? true : byPid()));
+}
+
+/** 找出所有命令行里带这个 profile 目录的 Edge/Chrome 进程并结束（含子进程） */
+function closeProfileWindows(profile) {
+  return new Promise((resolve) => {
+    if (!profile) return resolve(0);
+    const { execFile } = require('node:child_process');
+    const ps =
+      `Get-CimInstance Win32_Process -Filter "Name='msedge.exe' OR Name='chrome.exe'" | ` +
+      `Where-Object { $_.CommandLine -like '*${profile.replace(/\\/g, '\\\\')}*' } | ` +
+      `ForEach-Object { $_.ProcessId }`;
+    try {
+      execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { timeout: 8000 }, (err, stdout) => {
+        if (err || !stdout) return resolve(0);
+        const pids = String(stdout)
+          .split(/\s+/)
+          .map((s) => Number(s))
+          .filter((n) => Number.isInteger(n) && n > 0);
+        if (!pids.length) return resolve(0);
+        let left = pids.length;
+        for (const p of pids) {
+          try {
+            execFile('taskkill', ['/PID', String(p), '/T', '/F'], () => {
+              if (--left === 0) resolve(pids.length);
+            });
+          } catch {
+            if (--left === 0) resolve(pids.length);
+          }
+        }
+      });
+    } catch {
+      // 沙箱/受限环境里 spawn 可能直接抛 EPERM：清不掉不等于开不了窗，继续往下走
+      resolve(0);
+    }
+  });
+}
+
+/** 配置目录要能写；写不进去（被别的权限级别占用/ACL 异常）就换到 %LOCALAPPDATA% 下 */
+function usableProfile(preferred, tag) {
+  try {
+    fs.mkdirSync(preferred, { recursive: true });
+    const probe = path.join(preferred, '.write-test');
+    fs.writeFileSync(probe, 'ok');
+    fs.unlinkSync(probe);
+    return preferred;
+  } catch {
+    const base = process.env.LOCALAPPDATA || process.env.TEMP || ROOT;
+    const alt = path.join(base, 'DanmuRadar', `${tag || 'window'}-profile`);
+    try {
+      fs.mkdirSync(alt, { recursive: true });
+      console.log(`[界面] 配置目录不可用，改用 ${alt}`);
+      return alt;
+    } catch {
+      return preferred;
+    }
+  }
+}
+
+async function closeOldAppWindow() {
+  const st = readAppWindowState();
+  const pid = st.pid;
+  if (!pidAlive(pid)) {
+    clearAppWindowState();
+    return true;
+  }
+  closingAppWindowPid = pid;
+  // 必须连子进程一起结束：浏览器主进程退了，渲染/GPU 子进程还会攥着 profile 一会儿，
+  // 这时抢先 spawn 新窗口，浏览器会把它降级成一个停在 127.0.0.1/ 的白页。
+  await killTree(pid);
+  // 等 profile 锁真正释放，否则新窗口还是会被转交成白页
+  for (let i = 0; i < 20 && pidAlive(pid); i++) {
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  await new Promise((r) => setTimeout(r, 600));
+  // 除了自己记录的 pid，把任何还在用这份 profile 的浏览器也清掉：
+  // 高权限（管理员）起的那个会攥着配置目录，普通权限的新窗口拿不到它，只能开出白页。
+  if (st.profile) await closeProfileWindows(st.profile);
+  clearAppWindowState();
+  // 杀不掉（比如它是以管理员身份起的）就别再拿同一份 profile 硬开
+  return !pidAlive(pid);
+}
+
+/** 起一个 --app 窗口；返回子进程（失败返回 null）。退出回调负责托盘/停采集那套语义 */
+function launchAppWindow(exe, url, profile) {
+  const { spawn } = require('node:child_process');
+  try {
+    fs.mkdirSync(profile, { recursive: true });
+  } catch {
+    /* ignore */
+  }
+  const argv = [
+    `--app=${url}`,
+    `--user-data-dir=${profile}`,
+    '--window-size=1360,820',
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--disable-features=Translate,MediaRouter',
+  ];
+  const p = spawn(exe, argv,
+    // 不用 detached：实测 detached:true 起的 --app 窗口出现过「进程在、标题空、页面不加载」的白页，
+    // 去掉 detached 后正常；配合下面的 unref()，窗口照样能活过父进程。
+    { stdio: 'ignore', windowsHide: false }
+  );
+  p.on('error', (err) => {
+    console.log(`[界面] 打开独立窗口失败：${err.code || err.message}（${exe}）`);
+  });
+  p.on('spawn', () => {
+    console.log(`[界面] 已打开独立窗口（${path.basename(exe)}）`);
+    writeAppWindowState(p.pid, exe, profile);
+  });
+  p.unref();
+  appWindowChild = p;
+  const startedAt = Date.now();
+  p.on('exit', (code) => {
+    const lived = Date.now() - startedAt;
+    if (appWindowChild === p) appWindowChild = null;
+    // 是我们自己为了重开而关掉的旧窗口：不算用户关窗，也别再开标签页
+    if (closingAppWindowPid && closingAppWindowPid === p.pid) {
+      closingAppWindowPid = 0;
+      return;
+    }
+    clearAppWindowState(p.pid);
+    // 刚起来就退：多半是浏览器把请求转给了同 profile 的旧进程，或直接报错。
+    // 这时不能当成「用户关了窗口」。若外层正在重试别的浏览器，就交给外层处理，别重复开。
+    if (lived < 5000) {
+      if (clients.size > 0 || openingUi) return;
+      console.log(`\n[界面] 独立窗口没能起来（${lived}ms 后退出，code=${code}），改用浏览器标签打开。`);
+      openBrowser({ noApp: true });
+      return;
+    }
+    // 还有别的界面连着（比如浏览器标签还开着），就不算「关掉程序」
+    if (clients.size > 0) {
+      console.log('\n[界面] 独立窗口已关闭，但还有别的界面在用，继续采集。');
+      return;
+    }
+    const ui = getUISettings();
+    if (ui.closeAction === 'tray') {
+      console.log('\n[界面] 窗口已关闭，按设置缩到系统托盘。');
+      ensureTray();
+      return;
+    }
+    if (!ui.stopOnWindowClose) return;
+    console.log('\n[界面] 独立窗口已关闭 → 按设置停止采集。');
+    shutdown('窗口关闭');
+  });
+  return p;
+}
+
+/** 杀掉一个进程及其子进程（浏览器主进程退了，渲染子进程还会攥着 profile） */
+async function killTree(pid) {
+  if (!pid) return;
+  await new Promise((resolve) => {
+    const { execFile } = require('node:child_process');
+    try {
+      execFile('taskkill', ['/PID', String(pid), '/T', '/F'], () => resolve());
+    } catch {
+      resolve();
+    }
+  });
+}
+
+/** 等一个新界面连上 SSE；连上说明页面真的起来了（白页永远不会连） */
+function waitForClient(before, timeoutMs) {
+  return new Promise((resolve) => {
+    const deadline = Date.now() + timeoutMs;
+    const tick = () => {
+      if (clients.size > before) return resolve(true);
+      if (Date.now() >= deadline) return resolve(false);
+      setTimeout(tick, 150);
+    };
+    tick();
+  });
+}
+
+/** 用 --app 开一个没有地址栏/标签页的独立窗口，像桌面软件 */
+async function openAppWindow() {
+  if (DRY_RUN) {
+    console.log('[界面] [dry] 会打开独立窗口');
+    return true;
+  }
+  openingUi = true;
+  try {
+    // 已经有窗口就把它提到前台，不关掉重开：重开会丢掉滚动位置和当前筛选，
+    // 而且「关掉再开」的空档里浏览器还攥着配置目录，正是之前白屏的温床。
+    const alive = activeAppPid();
+    if (alive) {
+      if (await focusAppWindow(alive)) {
+        console.log('[界面] 窗口已经开着，已提到前台');
+        ensureTray();
+        return true;
+      }
+      console.log('[界面] 有窗口但提不到前台（权限级别不同），关掉重开');
+    }
+    const url = `http://${HOST}:${PORT}/`;
+    const cands = browserCandidates();
+    if (!cands.length) {
+      console.log('[界面] 没找到 Chrome / Edge，无法打开独立窗口');
+      return false;
+    }
+    try {
+      await closeOldAppWindow();
+    } catch (err) {
+      console.log(`[界面] 关闭旧窗口时出错（继续）：${err.message}`);
+    }
+    // 逐个浏览器试：一个连不上界面（白屏）就关掉换下一个。
+    // Chrome 在前 —— 机器上存在「管理员权限的 Edge」时，普通权限的 Edge 开出来只会是白页或权限框。
+    for (const exe of cands) {
+      const name = browserName(exe);
+      try {
+        const profile = usableProfile(profileFor(exe), name);
+        // 同 profile 的后台残留进程会抢先接管新窗口，必须先清干净
+        await closeProfileWindows(profile);
+        const before = clients.size;
+        const p = launchAppWindow(exe, url, profile);
+        if (!p) continue;
+        ensureTray();
+        // 白页不会连 SSE：给它 6 秒，连不上就认作白屏，关掉换下一个
+        if (await waitForClient(before, 6000)) return true;
+        console.log(`[界面] ${name} 的独立窗口没连上界面（白屏），关掉再试下一个浏览器。`);
+        // 标记成「我们自己关的」，否则 exit 回调会把它当成用户关窗，按设置把采集也停掉
+        closingAppWindowPid = p.pid;
+        await killTree(p.pid);
+        clearAppWindowState(p.pid);
+      } catch (err) {
+        console.log(`[界面] 打开 ${name} 独立窗口出错（换下一个）：${err.message}`);
+      }
+    }
+    console.log('[界面] 所有浏览器都没开出可用的独立窗口，改用浏览器标签打开。');
+    return openBrowser({ noApp: true, force: true });
+  } catch (err) {
+    console.log(`[界面] 打开独立窗口失败：${err.message}`);
+    return false;
+  } finally {
+    openingUi = false;
+  }
+}
+
 function openBrowser(opts = {}) {
+  // 端口必须是确定的数字：拼出 http://127.0.0.1:0 这类地址时浏览器会把它当 80 端口，
+  // 打开一个永远不会有人应答的白页，比「没打开」更难排查。
+  if (!Number.isInteger(PORT) || PORT <= 0) {
+    console.log(`[界面] 端口无效（${PORT}），跳过自动打开`);
+    return Promise.resolve(false);
+  }
   const url = `http://${HOST}:${PORT}`;
   const { spawn } = require('node:child_process');
   const run = (cmd, args) =>
@@ -1313,15 +1667,53 @@ function openBrowser(opts = {}) {
     }
     if (DRY_RUN) return true;
 
+    // 实际要打开的地址写进日志：出问题时能一眼看出是地址错了还是窗口没起来
+    console.log(`[界面] 打开 ${url}/`);
+
     if (process.platform !== 'win32') {
       const opener = process.platform === 'darwin' ? 'open' : 'xdg-open';
       const args = mode === 'app' && process.platform === 'darwin' ? ['-a', 'Google Chrome', '--args', `--app=${url}`] : [url];
       return await run(opener, args);
     }
-    if (!opts.noApp && mode !== 'browser' && openAppWindow()) return true;
-    if (await run('cmd', ['/c', 'start', '', url])) return true;
-    if (await run('rundll32', ['url.dll,FileProtocolHandler', url])) return true;
-    return await run('explorer.exe', [url]);
+    if (!opts.noApp && mode !== 'browser' && (await openAppWindow())) return true;
+
+    // 不再「只要进程起来了就算打开」——cmd start 会立刻返回 0，用户却可能只看到一个权限框。
+    // 现在必须等到真的有一页连上 SSE 才算成功；15 秒内都不行就往上抛失败，让界面给明确提示。
+    const deadline = Date.now() + 12000;
+    const left = (ms) => Math.max(1500, Math.min(ms, deadline - Date.now()));
+    for (const exe of browserCandidates()) {
+      const name = browserName(exe);
+      const before = clients.size;
+      // Chrome 用默认配置：开在用户平时用的窗口里，标签页模式更自然。
+      // Edge 用独立配置：机器上有「管理员权限的 Edge」时，默认配置只会弹权限框/开白页。
+      const args =
+        name === 'chrome'
+          ? ['--new-window', url, '--no-first-run', '--no-default-browser-check']
+          : [`--user-data-dir=${usableProfile(profileFor(exe), 'edge')}`, '--new-window', url, '--no-first-run', '--no-default-browser-check'];
+      console.log(`[界面] 用 ${name} 打开浏览器窗口`);
+      if (!(await run(exe, args))) continue;
+      if (await waitForClient(before, left(6000))) {
+        ensureTray();
+        return true;
+      }
+      console.log(`[界面] ${name} 里没有界面连上来，换下一个方式`);
+      if (Date.now() >= deadline) break;
+    }
+    // 最后才交给系统默认浏览器（可能还是被高权限占着的 Edge，所以只当兜底）
+    for (const [cmd, args] of [
+      ['rundll32', ['url.dll,FileProtocolHandler', `${url}/`]],
+      ['explorer.exe', [`${url}/`]],
+    ]) {
+      const before = clients.size;
+      if (!(await run(cmd, args))) continue;
+      if (await waitForClient(before, left(4000))) {
+        ensureTray();
+        return true;
+      }
+      if (Date.now() >= deadline) break;
+    }
+    console.log('[界面] 没能打开可用的浏览器窗口，界面里会提示手动打开地址。');
+    return false;
   })();
 }
 

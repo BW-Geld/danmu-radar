@@ -2279,6 +2279,10 @@ $('#ui-save').addEventListener('click', async () => {
 });
 
 $('#ui-open').addEventListener('click', async () => {
+  const btn = $('#ui-open');
+  btn.disabled = true;
+  // 开窗口要等页面真的连上来（最多十几秒），这段空档必须让按钮有反馈，否则就像「点了没反应」
+  $('#ui-status').textContent = '正在打开独立窗口…';
   try {
     // 直接把当前地址当独立窗口打开（即使当前已经是 app 模式也要能手动唤出）
     const d = await api('/api/ui', {
@@ -2287,24 +2291,33 @@ $('#ui-open').addEventListener('click', async () => {
     });
     $('#ui-status').textContent = d.opened
       ? '已打开独立窗口（如果没有出现，看任务栏有没有新窗口）'
-      : '没找到 Edge 或 Chrome，打不开独立窗口';
+      : '没能打开独立窗口：浏览器可能被「以管理员身份运行」的实例挡住了。手动打开 ' + location.origin + ' 即可，或关掉那个高权限浏览器再点一次';
   } catch (err) {
+    $('#ui-status').textContent = '打开独立窗口失败：' + err.message;
     toast(err.message, true);
+  } finally {
+    btn.disabled = false;
   }
 });
 
 $('#ui-open-tab').addEventListener('click', async () => {
+  const btn = $('#ui-open-tab');
+  btn.disabled = true;
+  $('#ui-status').textContent = '正在打开浏览器窗口…';
   try {
-    // 不管当前是什么模式，都在默认浏览器里再开一个标签页
+    // 不管当前是什么模式，都在浏览器里再开一个窗口
     const d = await api('/api/ui', {
       method: 'POST',
       body: JSON.stringify({ openWindow: 'browser' }),
     });
     $('#ui-status').textContent = d.opened
       ? '已在浏览器里打开（看任务栏或浏览器新标签）'
-      : '没能打开浏览器，手动访问 ' + location.origin;
+      : '没能打开浏览器：可能被「以管理员身份运行」的实例挡住了。手动访问 ' + location.origin;
   } catch (err) {
+    $('#ui-status').textContent = '打开浏览器失败：' + err.message;
     toast(err.message, true);
+  } finally {
+    btn.disabled = false;
   }
 });
 

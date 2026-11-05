@@ -10,7 +10,6 @@
  */
 
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
 
@@ -77,9 +76,22 @@ function metaMap(db) {
   return out;
 }
 
-function tempPath(tag) {
-  const dir = path.join(os.tmpdir(), 'danmu-radar-lib');
+// 临时库放在 data\tmp\ 而不是系统临时目录：
+// 便携版可能在受限账户/沙箱里跑，%TEMP% 未必可写（实测 node:sqlite 直接报
+// 「unable to open database file」）；data 目录一定是可写的，同盘复制也更快。
+function tempPath(storePath, tag) {
+  const dir = path.join(path.dirname(storePath), 'tmp');
   fs.mkdirSync(dir, { recursive: true });
+  // 顺手清掉上次没删干净的（超过 1 天的）
+  try {
+    const cutoff = Date.now() - 86400000;
+    for (const f of fs.readdirSync(dir)) {
+      const p = path.join(dir, f);
+      if (fs.statSync(p).mtimeMs < cutoff) fs.rmSync(p, { force: true });
+    }
+  } catch {
+    /* 清理失败不影响导出 */
+  }
   return path.join(dir, `${tag}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.db`);
 }
 
@@ -94,7 +106,7 @@ function exportLibrary(store, opts = {}) {
   const to = Number(opts.to) || 0;
   const anon = opts.anon !== false; // 默认匿名
 
-  const file = tempPath('export');
+  const file = tempPath(store.path, 'export');
   const db = new DatabaseSync(file);
   db.exec(PKG_SCHEMA);
   db.exec(`ATTACH DATABASE '${store.path.replace(/'/g, "''")}' AS src`);

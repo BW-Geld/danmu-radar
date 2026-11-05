@@ -14,6 +14,16 @@ $dataDir = Join-Path $PSScriptRoot '..\data'
 $pidFile = Join-Path $dataDir 'tray.pid'
 $errFile = Join-Path $dataDir 'tray-error.log'
 
+# 只允许一个托盘图标：已经有活着的托盘进程就直接退出。
+# 服务端那边有 10 秒冷却，但旧进程残留、或两个实例同时起时，还需要这层兜底。
+try {
+  if (Test-Path $pidFile) {
+    $old = 0
+    [void][int]::TryParse((Get-Content -Path $pidFile -TotalCount 1 -ErrorAction SilentlyContinue), [ref]$old)
+    if ($old -and $old -ne $PID -and (Get-Process -Id $old -ErrorAction SilentlyContinue)) { exit 0 }
+  }
+} catch { }
+
 try {
   Set-Content -Path $pidFile -Value $PID -Encoding ASCII
 } catch { }
@@ -52,15 +62,17 @@ try {
   $open = $menu.Items.Add('打开界面')
   $quit = $menu.Items.Add('停止采集并退出')
 
-  $open.add_Click({
+  # 优先让服务把已有窗口提到前台；服务里那段逻辑是「有窗口就激活、没有才新开」
+  $showUI = {
     $ok = $false
     try {
-      $body = '{"openWindow":"app"}'
-      Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/ui" -Method Post -ContentType 'application/json' -Body $body -TimeoutSec 5 | Out-Null
+      Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/ui/activate" -Method Post -ContentType 'application/json' -Body '{}' -TimeoutSec 8 | Out-Null
       $ok = $true
     } catch { }
     if (-not $ok) { Start-Process $Url }
-  })
+  }
+
+  $open.add_Click($showUI)
 
   $quit.add_Click({
     try {
@@ -72,7 +84,8 @@ try {
   })
 
   $icon.ContextMenuStrip = $menu
-  $icon.add_DoubleClick({ Start-Process $Url })
+  # 双击图标 = 同一个动作：有窗口就提到前台，没有才开
+  $icon.add_DoubleClick($showUI)
 
   # 服务没了就自己退（每 5 秒探一次）
   $timer = New-Object System.Windows.Forms.Timer
