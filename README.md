@@ -29,20 +29,10 @@
 **数据存在哪**：程序目录下的 `data\danmaku.db`，同目录还有同名的 `-wal`、`-shm`，三个是一套。
 备份就把整个 `data\` 复制走，记得先退出程序。
 
-## 从源码运行
-
-需要 Node.js 22 以上（`node:sqlite` 是内置模块，所以不用 `npm install` 任何东西）。
-
-```bash
-node server/index.js
-```
-
-首次启动会自动建库，然后打开 http://127.0.0.1:7788 。
-
 ## 技术细节
 
 - **零第三方依赖**：完全基于 Node.js 原生模块开发，无任何 `npm install`
-- **底层协议直连**：手写 TLS 与 WebSocket 握手，原生解析斗鱼 STT 二进制协议
+- **底层协议直连**：基于 TLS 与 WebSocket 握手，原生解析斗鱼 STT 二进制协议
 - **本地化存储**：基于内置 `node:sqlite`，WAL 模式批量落库，支持断线重连与采集缺口记录
 
 ## 声明
