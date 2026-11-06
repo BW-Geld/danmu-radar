@@ -1394,6 +1394,27 @@ $('#uid').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') runProfile($('#uid').value.trim());
 });
 
+/**
+ * 输入框既收 UID 也收昵称。纯数字直接当 UID；否则先按昵称查一遍，
+ * 优先「完全同名」的，其次发言最多的那个。
+ */
+async function resolveUserInput(raw) {
+  const input = String(raw || '').trim();
+  if (!input) throw new Error('请输入 UID 或昵称');
+  if (/^\d+$/.test(input)) return input;
+
+  const d = await api('/api/users?q=' + encodeURIComponent(input));
+  const list = d.users || [];
+  if (!list.length) throw new Error(`本地没有昵称包含「${input}」的用户`);
+
+  const exact = list.find((u) => u.nn === input);
+  const pick = exact || list[0];
+  if (!exact && list.length > 1) {
+    toast(`「${input}」对上 ${list.length} 个用户，取发言最多的「${pick.nn || pick.uid}」（${fmtNum(pick.n)} 条）`);
+  }
+  return String(pick.uid);
+}
+
 async function runProfile(uid) {
   if (!uid) {
     toast('请输入 UID 或昵称');
@@ -1403,7 +1424,7 @@ async function runProfile(uid) {
   btn.disabled = true;
   btn.textContent = '分析中…';
   try {
-    const d = await api('/api/users/' + encodeURIComponent(uid));
+    const d = await api('/api/users/' + encodeURIComponent(await resolveUserInput(uid)));
     renderProfile(d);
   } catch (err) {
     renderProfileError(err.message);
