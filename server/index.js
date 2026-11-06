@@ -1697,38 +1697,20 @@ function openBrowser(opts = {}) {
 
     // 不再「只要进程起来了就算打开」——cmd start 会立刻返回 0，用户却可能只看到一个权限框。
     // 现在必须等到真的有一页连上 SSE 才算成功；15 秒内都不行就往上抛失败，让界面给明确提示。
-    const deadline = Date.now() + 12000;
-    const left = (ms) => Math.max(1500, Math.min(ms, deadline - Date.now()));
-    for (const exe of browserCandidates()) {
-      const name = browserName(exe);
-      const before = clients.size;
-      // Chrome 用默认配置：开在用户平时用的窗口里，标签页模式更自然。
-      // Edge 用独立配置：机器上有「管理员权限的 Edge」时，默认配置只会弹权限框/开白页。
-      const args =
-        name === 'chrome'
-          ? ['--new-window', url, '--no-first-run', '--no-default-browser-check']
-          : [`--user-data-dir=${usableProfile(profileFor(exe), 'edge')}`, '--new-window', url, '--no-first-run', '--no-default-browser-check'];
-      console.log(`[界面] 用 ${name} 打开浏览器窗口`);
-      if (!(await run(exe, args))) continue;
-      if (await waitForClient(before, left(6000))) {
-        ensureTray();
-        return true;
-      }
-      console.log(`[界面] ${name} 里没有界面连上来，换下一个方式`);
-      if (Date.now() >= deadline) break;
+    // 已经有一页开着就把它提出来，绝不另起浏览器进程
+    if (await focusAnyWindow()) {
+      console.log('[界面] 已经有一页开着，直接切过去了');
+      return true;
     }
-    // 最后才交给系统默认浏览器（可能还是被高权限占着的 Edge，所以只当兜底）
-    for (const [cmd, args] of [
-      ['rundll32', ['url.dll,FileProtocolHandler', `${url}/`]],
-      ['explorer.exe', [`${url}/`]],
-    ]) {
-      const before = clients.size;
-      if (!(await run(cmd, args))) continue;
-      if (await waitForClient(before, left(4000))) {
-        ensureTray();
-        return true;
-      }
-      if (Date.now() >= deadline) break;
+
+    // 只用资源管理器去开：走的是用户当前那个浏览器实例（新增一个标签页），
+    // 不新起进程、不碰自建配置目录，所以不会再出现白窗和「以提升的权限运行」的弹窗。
+    const before = clients.size;
+    const okExplorer = await run('explorer.exe', [`${url}/`]);
+    if (!okExplorer) await run('rundll32', ['url.dll,FileProtocolHandler', `${url}/`]);
+    if (await waitForClient(before, 14000)) {
+      ensureTray();
+      return true;
     }
     console.log('[界面] 没能打开可用的浏览器窗口，界面里会提示手动打开地址。');
     return false;
