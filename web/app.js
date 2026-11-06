@@ -577,8 +577,19 @@ $('#live-filter').addEventListener('input', (e) => {
 
 // ------------------------------------------------------------ 检索页
 
-function renderRoomOptions() {
-  for (const id of ['#s-rid', '#b-rid', '#t-rid', '#lib-rid', '#f-rid']) {
+/** 重新拉房间列表并重绘左栏 + 各页面下拉。导入库包、录播导入、增删房间后都要调。 */
+async function refreshRooms() {
+  try {
+    const d = await api('/api/rooms');
+    state.rooms = d.rooms || [];
+    renderRooms();
+    renderRoomOptions();
+  } catch (err) {
+    console.log('刷新房间列表失败：' + err.message);
+  }
+}
+
+function renderRoomOptions() {  for (const id of ['#s-rid', '#b-rid', '#t-rid', '#lib-rid', '#f-rid']) {
     const sel = $(id);
     if (!sel) continue;
     const cur = sel.value;
@@ -2228,6 +2239,9 @@ $('#lib-import').addEventListener('click', async () => {
     toast(`导入完成：新增 ${fmtNum(d.inserted)} 条`);
     loadSettings();
     refreshStats();
+    // 库包里带的房间要立刻出现在左栏和三个页面的下拉里，
+    // 不能等用户刷新页面（用户报过这个）
+    await refreshRooms();
   } catch (err) {
     $('#lib-status').textContent = '';
     toast(err.message, true);
@@ -2505,6 +2519,7 @@ $('#vod-import')?.addEventListener('click', async () => {
     $('#vod-input').value = '';
     loadVod();
     loadSettings();
+    await refreshRooms();
     refreshStats();
   } catch (err) {
     st.textContent = '';
