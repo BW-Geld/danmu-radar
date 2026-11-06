@@ -394,6 +394,7 @@ async function stopRoom(rid, forget = false) {
     state.rooms = state.rooms.filter((r) => r.rid !== rid);
     if (state.liveRid === rid) selectRoom(null);
     renderRooms();
+    renderRoomOptions();
     if (forget) toast(`已删除 ${fmtNum(d.removed || 0)} 条弹幕，并移出列表`);
     else toast('已停止采集');
   } catch (err) {
@@ -540,6 +541,9 @@ async function addRoom() {
     const rooms = await api('/api/rooms');
     state.rooms = rooms.rooms || [];
     renderRooms();
+    // 关键词检索 / 排行榜 / 时间线 的房间下拉也读 state.rooms，不重绘的话
+    // 新加的房间要等刷新页面才出现（用户报过这个）
+    renderRoomOptions();
     if (d.added && d.added.length) selectRoom(d.added[0].rid);
   } catch (err) {
     toast(err.message, true);
