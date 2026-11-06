@@ -362,6 +362,18 @@ class Store {
     return this;
   }
 
+  /**
+   * 库文件被外部删掉/挪走时，SQLite 会**静默**新建一个空库继续写：历史没了，界面却一切正常。
+   * 每次落库前先确认文件还在，不在就抛错让采集器停下来报警（错误码 DB_FILE_GONE）。
+   */
+  assertDbFile() {
+    if (!this.path) return;
+    if (fs.existsSync(this.path)) return;
+    const err = new Error('数据库文件不见了：' + this.path);
+    err.code = 'DB_FILE_GONE';
+    throw err;
+  }
+
   close() {
     try {
       this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
@@ -505,6 +517,7 @@ class Store {
    */
   insertBatch(rows, { ignore = true } = {}) {
     if (!rows.length) return { attempted: 0, inserted: 0, dupes: 0 };
+    this.assertDbFile();
     const ins = this.stmt(
       `INSERT ${ignore ? 'OR IGNORE' : ''} INTO messages
          (rid, room_name, uid, nn, txt, ntxt, cst, level, bnn, bl, brid, kind, gfid, gfcnt, source, ext, hkey, topic, stem)
@@ -955,6 +968,7 @@ class Store {
   }
 
   touchRooms(rows) {
+    this.assertDbFile();
     const byRoom = new Map();
     for (const r of rows) {
       const cur = byRoom.get(r.rid) || { n: 0, last: 0 };

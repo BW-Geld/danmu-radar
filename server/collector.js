@@ -236,6 +236,7 @@ class Collector extends EventEmitter {
   }
 
   flush() {
+    if (this.broken) return;
     if (this.dupes.length) {
       const list = this.dupes;
       this.dupes = [];
@@ -256,6 +257,19 @@ class Collector extends EventEmitter {
         this.emit('messages', rows);
       }
     } catch (err) {
+      // 库文件被外部删掉/挪走：不能再写了。SQLite 会在原路径静默建一个空库，
+      // 继续写等于把数据丢进新库、历史全没，而界面看不出异常；采集器内存里的房间
+      // 还会被重新写回去，看起来像"删了库房间还在"。
+      if (err && err.code === 'DB_FILE_GONE') {
+        if (!this.broken) {
+          this.broken = true;
+          this.buffer = [];
+          this.log(`【严重】${err.message}；已停止采集，避免把数据写进新建的空库`);
+          this.stopAll();
+          this.emit('dbgone', err);
+        }
+        return;
+      }
       this.log(`落库失败：${err.message}`);
       // 写失败时把数据放回缓冲（限制上限，避免内存爆掉）
       this.buffer = rows.concat(this.buffer).slice(-2000);

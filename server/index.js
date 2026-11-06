@@ -314,6 +314,13 @@ collector.on('messages', (rows) => {
 collector.on('rooms', () => broadcast('rooms', roomListFull()));
 collector.on('status', (st) => broadcast('status', st));
 
+// 库文件被外部删掉/挪走：采集已停，这里要把话说清楚——写日志、推给界面。
+collector.on('dbgone', (err) => {
+  console.error(`[严重] ${err.message}`);
+  console.error('[严重] 已停止采集。把库文件放回原位（或从备份恢复）后重启程序即可继续。');
+  broadcast('dbgone', { message: err.message, path: store.path || null, at: Date.now() });
+});
+
 // ---------------------------------------------------------------- helpers
 
 function json(res, code, obj) {
@@ -1754,11 +1761,34 @@ server.listen(PORT, HOST, async () => {
   console.log('  弹幕雷达 · 斗鱼弹幕统计工具');
   console.log(`  ▶ http://${HOST}:${PORT}`);
   console.log(`  ▶ 数据文件 ${store.path}`);
+  try {
+    // 启动时把库的实际情况写进日志：以后「库怎么空了/房间怎么还在」一看日志就有答案
+    const s = store.stats();
+    console.log(`  ▶ 库内 ${s.total} 条 / ${s.users} 用户 / ${store.listRooms().length} 个房间`);
+  } catch (err) {
+    console.log(`  ▶ 库状态读取失败：${err.message}`);
+  }
   console.log('');
 
   if (process.env.DANMU_OPEN === '1') openBrowser();
 
   collector.restore();
+
+  // 自愈：库里有大量弹幕却没有任何潮记录（外部合并/换库后常见），后台重建一次。
+  // 不重建的话，检索面板会显示「弹幕潮 0 次」，看着像功能坏了。
+  setTimeout(() => {
+    try {
+      const total = store.stats().total;
+      const events = store.db.prepare('SELECT COUNT(*) AS c FROM flood_events').get().c;
+      if (total > 1000 && events === 0) {
+        console.log(`[维护] 库内 ${total} 条但没有潮记录，后台重建…`);
+        const r = store.rebuildFloods({ since: 0 });
+        console.log(`[维护] 重建完成：${r.events} 个事件 / ${r.candidates} 个候选桶`);
+      }
+    } catch (err) {
+      console.log(`[维护] 潮记录自检失败：${err.message}`);
+    }
+  }, 5000).unref?.();
 
   // 浏览器标签模式没法拦「关窗口」，只能看界面连接断没断：断了给一段宽限期，还不回来就退出。
   setInterval(uiMonitor, 2000).unref?.();

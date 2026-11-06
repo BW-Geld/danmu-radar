@@ -188,6 +188,28 @@ es.addEventListener('prefs', () => {
   loadPrefs().catch(() => {});
 });
 
+// 库文件被外部删掉：采集已停，界面必须说清楚，否则会以为还在正常采
+es.addEventListener('dbgone', (e) => {
+  let d = {};
+  try {
+    d = JSON.parse(e.data);
+  } catch {
+    /* ignore */
+  }
+  toast(`数据库文件不见了，采集已停止：${d.path || ''}`, true, 15000);
+  const box = document.body;
+  if (box.querySelector('#dbgone-bar')) return;
+  const bar = document.createElement('div');
+  bar.id = 'dbgone-bar';
+  bar.style.cssText = [
+    'position:fixed', 'left:0', 'right:0', 'top:0', 'z-index:9999',
+    'background:#7a1f1f', 'color:#fff', 'padding:8px 14px', 'font-size:13px',
+    'text-align:center', 'box-shadow:0 2px 8px rgba(0,0,0,.4)',
+  ].join(';');
+  bar.textContent = `数据库文件不见了，采集已停止。把库文件放回原位后重启程序：${d.path || ''}`;
+  box.appendChild(bar);
+});
+
 es.onopen = () => setConn(true, '实时连接正常');
 es.onerror = () => setConn(false, '连接断开，正在重连…');
 
