@@ -1,4 +1,4 @@
-'use strict';
+﻿'use strict';
 
 /** 本地 HTTP 服务：REST API + SSE 实时推送 + 静态页面。 */
 
@@ -1211,11 +1211,29 @@ function trayAlive() {
   }
 }
 
+function killTrayProcesses() {
+  if (process.platform !== 'win32') return;
+  try {
+    const { execFileSync } = require('node:child_process');
+    execFileSync(
+      'powershell.exe',
+      [
+        '-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command',
+        "Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" | Where-Object { $_.CommandLine -like '*tray.ps1*' -and $_.ProcessId -ne $PID } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }",
+      ],
+      { timeout: 8000, windowsHide: true, stdio: 'ignore' }
+    );
+  } catch {}
+}
+
 function ensureTray() {
   if (trayAlive()) return true;
   // 刚拉过、pid 文件还没落盘的这段时间，直接当作已启动，避免重复拉
   if (trayChild && !trayChild.killed) return true;
   if (trayStartedAt && Date.now() - trayStartedAt < 10000) return true;
+  // 走到这儿说明 pid 文件不可信（上次的服务被杀、托盘还在）。
+  // 先把残留的托盘进程清干净再拉一个新的，否则会并排出现两个图标。
+  killTrayProcesses();
   if (process.platform !== 'win32') {
     console.log('[托盘] 目前只在 Windows 上支持缩到托盘');
     return false;
