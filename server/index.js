@@ -698,7 +698,8 @@ async function handleApi(req, res, url) {
     }
     // 没有独立窗口，但可能已经在浏览器标签里开着（标题含「弹幕雷达」）：把它叫出来就行，
     // 不要再启动一次浏览器——提权/普通权限混用时，再启动一次会弹 Windows 的「Edge 未响应」权限提示。
-    if (await focusAnyWindow()) {
+    // 用户明确点「开浏览器窗口」时必须真的开一个，不能被「把已有窗口提到前台」吞掉
+    if (!opts.force && (await focusAnyWindow())) {
       ensureTray();
       return json(res, 200, { ok: true, how: 'tab-focused' });
     }
@@ -1185,7 +1186,9 @@ function browserName(exe) {
 
 /** 每种浏览器一份专属配置目录 */
 function profileFor(exe) {
-  return path.join(ROOT, 'data', browserName(exe) === 'chrome' ? 'chrome-profile' : 'window-profile');
+  // 配置目录必须放在程序目录之外：放在 data\ 里时，服务拉起的 --app 窗口会白屏/退化成标签页
+  // （node 自身也必须从 %LOCALAPPDATA% 启动，同一条规律，A/B/C 三组对照实测）。
+  return path.join(process.env.LOCALAPPDATA || ROOT, 'DanmuRadar', browserName(exe) === 'chrome' ? 'chrome-profile' : 'win-profile');
 }
 
 // ---------------------------------------------------------------- 系统托盘
@@ -1401,8 +1404,21 @@ function focusAnyWindow() {
  * 白页窗口的标题是 `127.0.0.1_/`，匹配不到，正好被当成「不是好窗口」；
  * 再退回按 pid 的 AppActivate 兜底。返回是否真的提到了。
  */
+function pidIsAppWindow(pid) {
+  // 只看「进程活没活」会把浏览器标签页当成独立窗口：标签页标题里也有「弹幕雷达」，
+  // 于是每次点按钮都只是把标签页提到前台，看起来像「打不开独立窗口」。
+  try {
+    const { execFileSync } = require("node:child_process");
+    const out = execFileSync("powershell.exe", ["-NoProfile","-NonInteractive","-Command",
+      `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").CommandLine`],
+      { timeout: 6000, windowsHide: true }).toString();
+    return out.includes("--app=");
+  } catch { return false; }
+}
+
 function focusAppWindow(pid) {
   if (!pidAlive(pid)) return Promise.resolve(false);
+  if (!pidIsAppWindow(pid)) return Promise.resolve(false);
   const { execFile } = require('node:child_process');
   const script = path.join(ROOT, 'tools', 'focus.ps1');
   const byTitle = new Promise((resolve) => {
@@ -1623,7 +1639,12 @@ async function openAppWindow() {
       return false;
     }
     try {
-      await closeOldAppWindow();
+      const oldPid = activeAppPid();
+      if (oldPid && !pidIsAppWindow(oldPid)) {
+        console.log("[界面] 记录的进程不是独立窗口，跳过关闭它");
+      } else {
+        await closeOldAppWindow();
+      }
     } catch (err) {
       console.log(`[界面] 关闭旧窗口时出错（继续）：${err.message}`);
     }
@@ -1708,7 +1729,8 @@ function openBrowser(opts = {}) {
     // 不再「只要进程起来了就算打开」——cmd start 会立刻返回 0，用户却可能只看到一个权限框。
     // 现在必须等到真的有一页连上 SSE 才算成功；15 秒内都不行就往上抛失败，让界面给明确提示。
     // 已经有一页开着就把它提出来，绝不另起浏览器进程
-    if (await focusAnyWindow()) {
+    // 用户明确点「开浏览器窗口」时必须真的开一个，不能被「把已有窗口提到前台」吞掉
+    if (!opts.force && (await focusAnyWindow())) {
       console.log('[界面] 已经有一页开着，直接切过去了');
       return true;
     }
