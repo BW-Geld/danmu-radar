@@ -1244,6 +1244,14 @@ function ensureTray() {
       trayStartedAt = 0;
       console.log(`[托盘] 启动失败：${err.code || err.message}`);
     });
+    // 托盘进程自己退出（脚本判定服务器没了、被杀、系统休眠）时必须清掉记录，
+    // 否则 ensureTray() 会一直以为「还活着」，从此再也不拉起——图标就这么消失了。
+    p.on('exit', () => {
+      if (trayChild === p) {
+        trayChild = null;
+        trayStartedAt = 0;
+      }
+    });
     p.unref();
     trayChild = p;
     trayStartedAt = Date.now();
@@ -1739,6 +1747,13 @@ let lastTrayTry = 0;
 function uiMonitor() {
   const s = getUISettings();
   if (!uiAttached) return;
+
+  // 托盘要一直有人看着：图标可能因为脚本自己退出、系统重启资源管理器而消失，
+  // 而这时候界面往往正开着（下面会因为 clients>0 提前 return），没人补。
+  if (s.closeAction === 'tray' && !trayAlive() && Date.now() - lastTrayTry > 30000) {
+    lastTrayTry = Date.now();
+    if (ensureTray()) console.log('[托盘] 图标不见了，已重新拉起');
+  }
 
   if (clients.size > 0) {
     if (graceSince) console.log('[界面] 界面回来了，取消退出倒计时。');
