@@ -1,4 +1,4 @@
-'use strict';
+﻿'use strict';
 
 /* 弹幕雷达前端：无框架、无构建，直接操作 DOM。 */
 
@@ -2282,18 +2282,18 @@ $('#ui-open').addEventListener('click', async () => {
   const btn = $('#ui-open');
   btn.disabled = true;
   // 开窗口要等页面真的连上来（最多十几秒），这段空档必须让按钮有反馈，否则就像「点了没反应」
-  $('#ui-status').textContent = '正在打开独立窗口…';
+  $('#ui-status').textContent = '正在打开界面…';
   try {
     // 直接把当前地址当独立窗口打开（即使当前已经是 app 模式也要能手动唤出）
     const d = await api('/api/ui', {
       method: 'POST',
-      body: JSON.stringify({ windowMode: 'app', open: true }),
+      body: JSON.stringify({ openWindow: 'browser' }),
     });
     $('#ui-status').textContent = d.opened
-      ? '已打开独立窗口（如果没有出现，看任务栏有没有新窗口）'
-      : '没能打开独立窗口：浏览器可能被「以管理员身份运行」的实例挡住了。手动打开 ' + location.origin + ' 即可，或关掉那个高权限浏览器再点一次';
+      ? '已打开（没弹出来的话，看浏览器的新标签页）'
+      : '没能打开：手动打开 ' + location.origin + ' 也可以';
   } catch (err) {
-    $('#ui-status').textContent = '打开独立窗口失败：' + err.message;
+    $('#ui-status').textContent = '打开界面失败：' + err.message;
     toast(err.message, true);
   } finally {
     btn.disabled = false;

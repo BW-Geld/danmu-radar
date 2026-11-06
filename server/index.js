@@ -1581,6 +1581,14 @@ function waitForClient(before, timeoutMs) {
 
 /** 用 --app 开一个没有地址栏/标签页的独立窗口，像桌面软件 */
 async function openAppWindow() {
+  // 实测在这台机器上，服务进程拉起的 --app 窗口会被 Edge 的单实例/权限检查挡住，
+  // 屏幕上是「127.0.0.1_/」白页，反复换参数、换配置、换启动方式都绕不过去。
+  // 浏览器标签页这条路径是稳的，所以默认改走标签页；想再试验独立窗口就设
+  // DANMU_APP_WINDOW=1，代码原样保留。
+  if (process.env.DANMU_APP_WINDOW !== '1') {
+    console.log('[界面] 独立窗口改走浏览器标签页（这条路径稳定），如需实验独立窗口设 DANMU_APP_WINDOW=1');
+    return openBrowser({ noApp: true, force: true });
+  }
   if (DRY_RUN) {
     console.log('[界面] [dry] 会打开独立窗口');
     return true;
