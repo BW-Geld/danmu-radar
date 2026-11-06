@@ -1493,9 +1493,11 @@ function launchAppWindow(exe, url, profile) {
   } catch {
     /* ignore */
   }
+  // 不再指定 --user-data-dir：实测自建配置目录在服务里创建时会开出白页
+  // （目录在、进程在、标题空、页面不加载），而共用默认配置 1.8 秒就正常加载。
+  // 代价是窗口与用户日常浏览共用一份配置，好处是再没有「配置被别的实例占着」这类问题。
   const argv = [
     `--app=${url}`,
-    `--user-data-dir=${profile}`,
     '--window-size=1360,820',
     '--no-first-run',
     '--no-default-browser-check',
