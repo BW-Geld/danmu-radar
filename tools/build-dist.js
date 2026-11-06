@@ -46,71 +46,9 @@ echo   Exited. Press any key to close this window.
 pause >nul
 `;
 
-const README = `弹幕雷达 · 斗鱼弹幕统计（便携版）
-================================
-
-怎么用
-------
-1. 把整个文件夹（或解压出来的文件夹）放在一个你找得到的地方，比如 D:\\弹幕雷达。
-2. 双击 弹幕雷达启动程序.vbs —— 不会有黑色命令行窗口，程序在后台跑。
-   （弹幕雷达-调试启动.bat 是带窗口的调试版，只在启动不起来时用来看看报错。）
-3. 等一两秒，会弹出一个窗口（没有地址栏，像软件一样）。
-   如果没弹出来，手动打开浏览器访问 http://127.0.0.1:7788
-4. 在左侧输入直播间号（例如 6657）点「添加」，弹幕就开始实时入库了。
-
-不需要安装 Node.js，也不需要联网登录任何账号。
-
-文件夹里都是什么
-----------------
-弹幕雷达启动程序.vbs   日常用这个（双击，无黑框）
-在桌面创建快捷方式.vbs   双击一次，桌面就多一个带图标的「弹幕雷达」，以后点桌面那个
-assets\\danmu-radar.ico   上面那个快捷方式用的图标（不用管）
-弹幕雷达-调试启动.bat   出问题时用这个（有窗口，能看到报错）
-runtime\\node.exe     程序引擎（Node.js），不用管它，别双击
-server\\ web\\ shared\\  程序本体
-data\\                你的弹幕库和设置
-使用说明.txt          就是这份说明
-
-怎么退出
---------
-· 关掉那个独立窗口就行（默认会缩到右下角托盘继续采集）
-· 托盘图标右键 →「停止采集并退出」
-· 界面里 设置 → 界面与退出 →「停止采集并退出」
-
-日志
-----
-弹幕雷达启动程序.vbs 启动时，程序的输出写在 data\\server.log（超过 5MB 会自动改成 server.log.1）。
-启动不起来时先看这个文件。
-
-界面选择
---------
-设置 → 界面与退出：
-  · 独立窗口：没有地址栏和标签页，任务栏里是自己的图标
-  · 浏览器标签：用你平时的浏览器打开这个地址
-  · 关窗口时：缩小到系统托盘（采集继续）/ 停止采集（宽限期后退出）
-    （宽限秒数是给「误关 / 刷新页面」留的余地，这段时间内重新打开就继续采集）
-
-数据在哪
---------
-data\\danmaku.db       全部弹幕（SQLite，单文件）
-data\\soak.log         挂机采样日志（有的话）
-data\\lexicon.json     自定义词表（可选，自己建）
-
-备份：关掉程序，把 data\\danmaku.db 复制走就是完整备份。
-换电脑：复制整个文件夹，连带 data 目录一起。
-
-注意
-----
-· 关掉黑色控制台窗口 = 停止程序，会先把缓冲里的弹幕落盘。
-· 弹幕只有程序运行期间才采集，斗鱼不提供历史弹幕接口。
-· 端口被占用时程序会提示，并尝试直接打开已在运行的那个实例。
-· 想换端口：双击 弹幕雷达-调试启动.bat（调试版），在 node.exe 那一行前面加一行 set DANMU_PORT=7890
-  （启动程序不读这个，改了端口后用浏览器访问 http://127.0.0.1:7890 即可）
-
-卸载
-----
-删掉整个文件夹即可。没有注册表、没有系统服务、没有开机启动项。
-`;
+// 使用说明直接用仓库根目录的 README.md：两边只留一份文案，不会再出现「改了 README
+// 忘了改包里说明」的情况（写出去时转成 CRLF + BOM，记事本打开不乱码）。
+const README = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8');
 
 function copyDir(from, to, filter) {
   fs.mkdirSync(to, { recursive: true });
@@ -158,8 +96,11 @@ function build() {
   copyDir(path.join(ROOT, 'shared'), path.join(OUT, 'shared'));
 
   // 托盘脚本要跟着走，否则便携版里「缩到系统托盘」用不了
+  // focus.ps1 同理：开窗口前要靠它把已有窗口提到前台
   fs.mkdirSync(path.join(OUT, 'tools'), { recursive: true });
-  fs.copyFileSync(path.join(ROOT, 'tools', 'tray.ps1'), path.join(OUT, 'tools', 'tray.ps1'));
+  for (const f of ['tray.ps1', 'focus.ps1']) {
+    fs.copyFileSync(path.join(ROOT, 'tools', f), path.join(OUT, 'tools', f));
+  }
 
   const dataOut = path.join(OUT, 'data');
   fs.mkdirSync(dataOut, { recursive: true });
@@ -213,7 +154,9 @@ function build() {
 }
 
 function zip(dir) {
-  const target = path.join(DIST, `${NAME}.zip`);
+  // zip 的名字必须全 ASCII：GitHub 上传附件时会把文件名里的非 ASCII 字符直接删掉，
+  // 「弹幕雷达-便携版.zip」会变成「-.zip」，所以包名用英文，中文写在 Release 标题里。
+  const target = path.join(DIST, 'danmu-radar-portable.zip');
   fs.rmSync(target, { force: true });
   execFileSync(
     'powershell',
