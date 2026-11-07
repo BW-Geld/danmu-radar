@@ -5,8 +5,14 @@
  */
 
 const { EventEmitter } = require('node:events');
+const fs = require('node:fs');
+const path = require('node:path');
 const { WSClient } = require('./ws');
 const stt = require('./stt');
+
+// 未知消息类型日志（默认关闭）：DANMU_WS_LOG=1 打开，写到 data\ws-unknown.log
+const WS_LOG = process.env.DANMU_WS_LOG === '1';
+const WS_LOG_FILE = path.join(__dirname, '..', 'data', 'ws-unknown.log');
 
 const HOST = 'danmuproxy.douyu.com';
 const PORTS = [8501, 8502, 8503, 8504, 8505, 8506];
@@ -236,6 +242,23 @@ class DanmuClient extends EventEmitter {
           this.log(`服务端错误：${m.msg || m.error || JSON.stringify(m)}`);
           break;
         default:
+          // DANMU_WS_LOG=1 时把不认识的类型记下来。
+          // 用途：查「看点」「高光」这类功能到底走不走弹幕 WS——
+          // 直播时弹出来一次，日志里就能看到它的 type 和原文。
+          if (WS_LOG) {
+            try {
+              // 防止挂几天把盘写满：超过 5 MB 就截断重来
+              const st = fs.statSync(WS_LOG_FILE, { throwIfNoEntry: false });
+              if (st && st.size > 5 * 1024 * 1024) fs.truncateSync(WS_LOG_FILE, 0);
+              const line = JSON.stringify({
+                at: Date.now(),
+                rid: this.rid,
+                type: String(m.type || ''),
+                preview: JSON.stringify(m).slice(0, 300),
+              });
+              fs.appendFileSync(WS_LOG_FILE, line + '\n');
+            } catch {}
+          }
           break;
       }
     }
