@@ -1160,6 +1160,30 @@ class Store {
         if (!cur) samples.set(r.g, r);
         else if ((r.txt || '').length > (cur.txt || '').length) samples.set(r.g, r);
       }
+
+      // 上面那次是全局取前 N 行，长尾分组可能一条都挤不进来，
+      // 结果 group 里没有 rid/room/nn，界面就会显示「—」和「#undefined」。
+      // 对没取到样本的分组再补一次，用窗口函数保证每组恰好取一条最长样本。
+      const missing = keys.filter((k) => !samples.has(k));
+      if (missing.length) {
+        const again = this.db
+          .prepare(
+            `SELECT * FROM (
+               SELECT COALESCE(NULLIF(stem, ''), txt) AS g, id, rid, room_name, uid, nn, txt, cst,
+                      level, bnn, bl, source,
+                      ROW_NUMBER() OVER (
+                        PARTITION BY COALESCE(NULLIF(stem, ''), txt)
+                        ORDER BY LENGTH(txt) DESC, cst DESC
+                      ) AS rn
+               FROM messages
+               WHERE kind = 'chat' AND COALESCE(NULLIF(stem, ''), txt) IN (${missing.map(() => '?').join(',')})
+             ) WHERE rn = 1`
+          )
+          .all(...missing);
+        for (const r of again) {
+          if (!samples.has(r.g)) samples.set(r.g, r);
+        }
+      }
     }
 
     return groups.map((g) => {

@@ -745,10 +745,11 @@ function renderResults(d) {
   for (const r of list) {
     const row = h('div', 'result');
     const who = h('div', 'who');
-    const nn = h('div', 'nn', r.nn || r.uid || '—');
+    const nn = h('div', 'nn', r.nn || r.uid || (r.users ? `${r.users} 人在发` : '—'));
     if (r.uid) nn.addEventListener('click', () => openUser(r.uid));
     who.append(nn);
-    who.append(h('div', 'meta', r.room || `#${r.rid}`));
+    const metaText = r.room || (r.rid ? `#${r.rid}` : '');
+    if (metaText) who.append(h('div', 'meta', metaText));
     const body = h('div', 'body');
     const txtLine = h('div', 'txt');
     txtLine.append(h('span', null, r.disp || r.txt));
