@@ -124,7 +124,16 @@ function build() {
 
   writeCRLF(path.join(OUT, '弹幕雷达-调试启动.bat'), START_BAT);
   // 无窗口启动器：直接用仓库里的那份（UTF-16LE，wscript 才认得中文）
-  fs.copyFileSync(path.join(ROOT, '弹幕雷达启动程序.vbs'), path.join(OUT, '弹幕雷达启动程序.vbs'));
+  // 仓库根里那个 .vbs 是「开发用」的（跑源码、数据在仓库 data\）；
+// 便携版要的是自己那份启动器，内容由 tools\launcher-portable.vbs 维护。
+const LAUNCHER_SRC = path.join(ROOT, 'tools', 'launcher-portable.vbs');
+if (fs.existsSync(LAUNCHER_SRC)) {
+  fs.copyFileSync(LAUNCHER_SRC, path.join(OUT, '弹幕雷达启动程序.vbs'));
+} else {
+  const dev = path.join(ROOT, '开发用-启动源码版.vbs');
+  if (!fs.existsSync(dev)) throw new Error('找不到启动器源文件（tools\\launcher-portable.vbs 或 开发用-启动源码版.vbs）');
+  fs.copyFileSync(dev, path.join(OUT, '弹幕雷达启动程序.vbs'));
+}
   // 图标 + 「在桌面创建快捷方式」（.vbs 本身换不了图标，只能靠快捷方式）
   // 图标收进 assets\：它是被引用的素材，不该占着根目录；ASCII 名字也更稳
   fs.mkdirSync(path.join(OUT, 'assets'), { recursive: true });

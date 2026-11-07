@@ -315,8 +315,9 @@ async function fetchHighlights(rid) {
   if (!res.ok) throw new Error(`看点接口 HTTP ${res.status}`);
   const json = await res.json();
   if (json.error !== 0) throw new Error(json.msg || '看点接口返回错误');
-  const list = (json.data && json.data.highlightList) || [];
-  return list
+  const data = json.data || {};
+  const p = data.playback || {};
+  const list = (data.highlightList || [])
     .map((x) => ({
       id: String(x.highlightId || ''),
       title: String(x.title || ''),
@@ -328,6 +329,15 @@ async function fetchHighlights(rid) {
     }))
     .filter((x) => x.start > 0)
     .sort((a, b) => a.start - b.start);
+  return {
+    // 场次信息：showId 换场就变；startTime 是开播时刻（秒）；endTime 常为 0，不能用它判断下播
+    play: {
+      showId: String(p.showId || ''),
+      start: Number(p.startTime || 0) * 1000,
+      end: Number(p.endTime || 0) * 1000,
+    },
+    list,
+  };
 }
 
 module.exports = { fetchRoomInfo, fetchHighlights, DanmuClient, PORTS, HOST, toMs };

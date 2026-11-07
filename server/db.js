@@ -172,6 +172,26 @@ CREATE TABLE IF NOT EXISTS gaps (
   created_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_gaps_rid ON gaps(rid, from_cst);
+
+-- 本场「AI 看点」。斗鱼接口只给最近一场、没有日期维度，所以历史只能自己存。
+-- (rid, hl_id) 做主键天然去重：同一场反复拉只更新时间戳和有变化的文本。
+-- final=1 表示这一场已经下播、数据是全的（下播时由后台补拉一次）。
+CREATE TABLE IF NOT EXISTS highlights (
+  rid        INTEGER NOT NULL,
+  hl_id      TEXT NOT NULL,
+  show_id    TEXT NOT NULL DEFAULT '',
+  title      TEXT NOT NULL DEFAULT '',
+  summary    TEXT NOT NULL DEFAULT '',
+  descr      TEXT NOT NULL DEFAULT '',
+  start_ms   INTEGER NOT NULL,
+  end_ms     INTEGER NOT NULL DEFAULT 0,
+  heat       INTEGER NOT NULL DEFAULT 0,
+  final      INTEGER NOT NULL DEFAULT 0,
+  first_seen INTEGER NOT NULL,
+  last_seen  INTEGER NOT NULL,
+  PRIMARY KEY (rid, hl_id)
+);
+CREATE INDEX IF NOT EXISTS idx_hl_start ON highlights(start_ms);
 `;
 
 function open(dbPath = DB_PATH) {
@@ -1291,6 +1311,81 @@ class Store {
    * 时间段内「说法」排行：按出现次数降序。
    * topPlusOne 是给排行榜看的（+1 口径），这个给时间线框选用（纯次数）。
    */
+  // ---- 本场看点（斗鱼 AI 高光）----
+  // 接口只给「最近一场」，所以这里把每次拉到的都落库，从而攒出历史。
+  saveHighlights(rid, showId, list, { final = false } = {}) {
+    if (!rid || !Array.isArray(list) || !list.length) return 0;
+    const now = Date.now();
+    const ins = this.db.prepare(
+      `INSERT INTO highlights
+         (rid, hl_id, show_id, title, summary, descr, start_ms, end_ms, heat, final, first_seen, last_seen)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+       ON CONFLICT(rid, hl_id) DO UPDATE SET
+         show_id   = excluded.show_id,
+         title     = excluded.title,
+         summary   = excluded.summary,
+         descr     = excluded.descr,
+         start_ms  = excluded.start_ms,
+         end_ms    = excluded.end_ms,
+         heat      = excluded.heat,
+         final     = MAX(highlights.final, excluded.final),
+         last_seen = excluded.last_seen`
+    );
+    this.db.exec('BEGIN');
+    try {
+      for (const it of list) {
+        if (!it || !it.id || !it.start) continue;
+        ins.run(
+          Number(rid), String(it.id), String(showId || ''),
+          String(it.title || ''), String(it.summary || ''), String(it.desc || ''),
+          Number(it.start), Number(it.end || 0), Number(it.heat || 0),
+          final ? 1 : 0, now, now
+        );
+      }
+      this.db.exec('COMMIT');
+    } catch (e) {
+      this.db.exec('ROLLBACK');
+      throw e;
+    }
+    return list.length;
+  }
+
+  // 下播时补拉一次，把这场标记为「已收尾、数据是全的」
+  markHighlightsFinal(rid, showId) {
+    if (!rid) return 0;
+    const r = showId
+      ? this.db.prepare('UPDATE highlights SET final = 1 WHERE rid = ? AND show_id = ?').run(Number(rid), String(showId))
+      : this.db.prepare('UPDATE highlights SET final = 1 WHERE rid = ?').run(Number(rid));
+    return r.changes || 0;
+  }
+
+  // 某天某房间的看点（按开始时间倒序，最新在上）
+  highlightsOfDay({ rid = 0, from, to, limit = 200 } = {}) {
+    const where = ['start_ms > 0'];
+    const args = [];
+    if (rid) {
+      where.push('rid = ?');
+      args.push(Number(rid));
+    }
+    if (from != null) {
+      where.push('start_ms >= ?');
+      args.push(Number(from));
+    }
+    if (to != null) {
+      where.push('start_ms <= ?');
+      args.push(Number(to));
+    }
+    const lim = Math.min(Math.max(Number(limit) || 200, 1), 1000);
+    return this.db
+      .prepare(
+        `SELECT rid, hl_id AS id, show_id AS showId, title, summary, descr AS "desc",
+                start_ms AS start, end_ms AS "end", heat, final
+           FROM highlights WHERE ${where.join(' AND ')}
+          ORDER BY start_ms DESC LIMIT ?`
+      )
+      .all(...args, lim);
+  }
+
   topPhrases({ rid, from, to, limit = 50, min = 2 } = {}) {
     const where = ["kind = 'chat'"];
     const args = [];
@@ -1746,6 +1841,8 @@ class Store {
   /** 保留策略：删除早于 N 天的弹幕 */  prune(days) {
     const cutoff = Date.now() - days * 86400000;
     const r = this.db.prepare('DELETE FROM messages WHERE cst < ?').run(cutoff);
+    // 看点跟着弹幕一起过期，否则清完弹幕还留着一堆跳不过去的看点
+    this.db.prepare('DELETE FROM highlights WHERE start_ms < ?').run(cutoff);
     this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
     return Number(r.changes) || 0;
   }

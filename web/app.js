@@ -859,15 +859,32 @@ function boardQuery() {
 /** 排行榜里用户名后面的小关注按钮（和「收藏」星标离得远一点，避免点错） */
 let boardData = null;
 
+/**
+ * 按内存里的 follows 把页面上所有「关注」小按钮刷成正确状态。
+ * 不重渲染整个列表，是因为按钮散落在排行榜/用户页等多处，
+ * 而且重渲染会丢滚动位置。
+ */
+function syncFollowChips() {
+  for (const b of document.querySelectorAll('.follow-chip[data-uid]')) {
+    const on = isFollowed(b.dataset.uid);
+    b.classList.toggle('on', on);
+    b.textContent = on ? '已关注' : '＋关注';
+    b.title = on ? '已关注（点一下取消）' : '关注这个人';
+  }
+}
+
 function followChip(u) {
   const on = isFollowed(u.uid);
   const b = h('button', 'follow-chip' + (on ? ' on' : ''), on ? '已关注' : '＋关注');
+  b.dataset.uid = String(u.uid);
   b.title = on ? '已关注（点一下取消）' : '关注这个人';
   b.addEventListener('click', async (ev) => {
     ev.stopPropagation();
     b.disabled = true;
     try {
-      if (on) {
+      // 点击时以「现在」的关注状态为准：按钮可能在别处被关注/取关过，
+      // 闭包里捕获的初值会过期（这正是取关后仍显示"已关注"的原因之一）
+      if (isFollowed(u.uid)) {
         confirmUnfollow({ uid: u.uid, nn: u.nn, total: u.n }, b);
       } else {
         const r = await api('/api/follows', {
@@ -1137,6 +1154,8 @@ async function loadFollows() {
     follows = [];
   }
   renderFollows();
+  // 排行榜等处的「＋关注 / 已关注」按钮跟着一起变，否则要刷新页面才对
+  syncFollowChips();
 }
 
 function isFollowed(uid) {
@@ -1247,6 +1266,7 @@ function confirmUnfollow(f, btn) {
         follows = follows.filter((y) => String(y.uid) !== String(f.uid));
         renderFollows();
         refreshFollowBtn();
+        syncFollowChips();
         toast('已取消关注');
         closeModal();
       } catch (err) {
@@ -2031,6 +2051,8 @@ async function loadFavorites() {
     fav.items = d.items || [];
     syncFavKeys();
     renderFavorites();
+    // 别的页面（检索结果、排行榜、时间线）上的星标也要立刻对上状态
+    refreshFavButtons();
   } catch (err) {
     toast(err.message, true);
   }
@@ -2089,10 +2111,18 @@ async function toggleFavorite(r) {
   refreshFavButtons();
 }
 
+/** 星标亮不亮：知道房间就按 (rid, stem) 比；「全部房间」时按说法比（任意房间有就算收藏） */
+function favOn(rid, stem) {
+  if (rid) return fav.keys.has(`${Number(rid)}|${stem}`);
+  return fav.items.some((f) => f.stem === stem);
+}
+
 /** 收藏状态变了以后，把页面上所有星标重新刷一遍（不只当前点的那一个） */
 function refreshFavButtons() {
   for (const b of document.querySelectorAll('.fav[data-key]')) {
-    const on = fav.keys.has(b.dataset.key);
+    const rid = Number(b.dataset.rid) || 0;
+    const stem = b.dataset.stem || (b.dataset.key || '').split('|').slice(1).join('|');
+    const on = favOn(rid, stem);
     b.classList.toggle('on', on);
     b.textContent = on ? '★' : '☆';
     b.title = on ? '取消收藏' : '收藏这句';
@@ -2101,10 +2131,14 @@ function refreshFavButtons() {
 
 /** 结果行右侧的星标：点一下收藏 / 取消 */
 function favButton(r) {
-  const key = favKey(r);
-  const on = fav.keys.has(key);
+  const rid = Number(r.rid) || 0;
+  const stem = r.stem || r.txt || '';
+  const key = `${rid}|${stem}`;
+  const on = favOn(rid, stem);
   const b = h('button', 'fav' + (on ? ' on' : ''), on ? '★' : '☆');
   b.dataset.key = key;
+  b.dataset.rid = String(rid);
+  b.dataset.stem = stem;
   b.title = on ? '取消收藏' : '收藏这句';
   b.addEventListener('click', async (ev) => {
     ev.stopPropagation();
@@ -2813,22 +2847,30 @@ async function loadHighlights() {
   const listBox = $('#t-hl-list');
   const count = $('#t-hl-count');
   const rid = $('#t-rid').value;
+  card.hidden = false;
   if (!rid) {
-    card.hidden = true;
+    // 保留卡片外壳：直接隐藏会让人以为功能没了
+    count.textContent = '';
+    listBox.textContent = '';
+    listBox.append(h('p', 'hint muted small', '查看看点请先在上方选一个房间。看点由斗鱼按房间生成，只能一场一场看。'));
     return;
   }
-  card.hidden = false;
+  const date = $('#t-date').value || fmtDate(Date.now());
   count.textContent = '加载中…';
   listBox.textContent = '';
   try {
-    const d = await api(`/api/highlights?rid=${rid}`);
+    const d = await api(`/api/highlights?rid=${rid}&date=${date}`);
     if (!d.ok) {
       count.textContent = '取不到：' + (d.error || '斗鱼没返回数据');
       return;
     }
     count.textContent = `共 ${d.list.length} 条`;
     if (!d.list.length) {
-      listBox.append(h('p', 'hint muted small', '这一场还没有看点。'));
+      listBox.append(
+        h('p', 'hint muted small', date === fmtDate(Date.now())
+          ? '这一场还没有看点（斗鱼还没生成，或这个房间最近没开播）。'
+          : '这一天没有存下看点。看点是从这个版本才开始存的，更早的场次斗鱼不再提供。')
+      );
       return;
     }
     const frag = document.createDocumentFragment();
@@ -2840,10 +2882,24 @@ async function loadHighlights() {
       const sub = [it.desc, it.summary].find((s) => s && s !== it.title) || '';
       if (sub) main.append(h('div', 'hl-desc muted small', sub));
       row.append(time, main);
+      if (it.final) row.append(h('div', 'hl-flag', '已收尾'));
       row.addEventListener('click', () => {
         const end = it.end > it.start ? it.end : it.start + 3 * 60000;
         const d0 = tl.data;
         if (!d0 || it.start < d0.from || it.start >= d0.to) {
+          if (fmtDate(it.start) !== $('#t-date').value) {
+            $('#t-date').value = fmtDate(it.start);
+            loadTimeline().then(() => {
+              const s2 = tlSelFromRange({ from: it.start, to: end });
+              if (s2) {
+                tl.sel = s2;
+                tlSaveSel();
+                tlDraw();
+                tlCommit();
+              }
+            });
+            return;
+          }
           toast('这条看点不在当前选中的日期里', true);
           return;
         }

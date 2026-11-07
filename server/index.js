@@ -214,11 +214,59 @@ setTimeout(() => {
 }, 20 * 1000).unref();
 setInterval(autoFloods, 60 * 1000).unref();
 
+// 看点：斗鱼只给「最近一场」，所以后台每 15 分钟给在播房间存一次快照；
+// 发现从「在播」变成「下播」时再补拉一次并标记 final（那一场就是全的）。
+setTimeout(() => {
+  highlightsSweep().catch(() => {});
+}, 90 * 1000).unref();
+setInterval(() => {
+  highlightsSweep().catch(() => {});
+}, 15 * 60 * 1000).unref();
+
 // ---------------------------------------------------------------- SSE
 
 const clients = new Set();
-// 看点列表的短期缓存：key=rid，value={ at, data }
+// 看点列表的短期缓存：key=rid，value={ at }
 const hlCache = new Map();
+// 每个房间上一次看到的开播状态，用来判断「刚刚下播」：1=在播、其它=下播
+const hlLive = new Map();
+
+/**
+ * 拉一次某房间的看点并落库。斗鱼这个接口永远返回「最近一场」的全部看点，
+ * 所以每拉一次就是这份快照；下播时用 final=true 再拉一次收尾。
+ */
+async function pullHighlights(rid, { final = false } = {}) {
+  const data = await douyu.fetchHighlights(rid);
+  const list = data && data.list ? data.list : [];
+  const showId = data && data.play ? data.play.showId : '';
+  if (list.length) store.saveHighlights(rid, showId, list, { final });
+  else if (final) store.markHighlightsFinal(rid, showId);
+  hlCache.set(rid, { at: Date.now() });
+  return { count: list.length, showId };
+}
+
+/** 后台巡检：在播的定期拉；刚下播的补拉一次并标记收尾 */
+async function highlightsSweep() {
+  for (const room of roomList()) {
+    const rid = Number(room.rid);
+    if (!rid) continue;
+    let live = 0;
+    try {
+      const info = await douyu.fetchRoomInfo(rid);
+      live = Number(info && info.room ? info.room.show_status : 0) === 1 ? 1 : 0;
+    } catch {
+      continue;
+    }
+    const before = hlLive.get(rid);
+    hlLive.set(rid, live);
+    try {
+      if (live) await pullHighlights(rid);
+      else if (before === 1) await pullHighlights(rid, { final: true });
+    } catch {
+      /* 网络抖动忽略，下一轮再来 */
+    }
+  }
+}
 // 关窗口即停采集：只要界面连过、又全部断开，就开始倒计时
 let uiAttached = false;
 let graceSince = 0;
@@ -513,20 +561,30 @@ async function handleApi(req, res, url) {
     return json(res, 200, { ok: true, date, from, to, bucketMs, total, max, buckets });
   }
 
-  // 本场「AI 看点」：转斗鱼的 getHighlightDetail，60 秒内存缓存（它每次都会新生成，别打太勤）
+  // 「AI 看点」：斗鱼只给最近一场、没有日期参数，所以历史靠自己落库。
+  // 今天 → 先按 60 秒节流去斗鱼拉一次、写库；其它日期 → 只读库。
   if (p === '/highlights' && req.method === 'GET') {
     const rid = Number(q.get('rid')) || 0;
     if (!rid) return json(res, 400, { ok: false, error: '缺少 rid' });
-    const hit = hlCache.get(rid);
-    if (hit && Date.now() - hit.at < 60000) return json(res, 200, { ok: true, cached: true, ...hit.data });
-    try {
-      const list = await douyu.fetchHighlights(rid);
-      const data = { rid, list, took: 0 };
-      hlCache.set(rid, { at: Date.now(), data });
-      return json(res, 200, { ok: true, cached: false, ...data });
-    } catch (err) {
-      return json(res, 200, { ok: false, rid, error: err.message, list: [] });
+    const { from, to, date } = dayRange(q.get('date'));
+    const isToday = date === dayRange('').date;
+    let live = false;
+    let err = '';
+    if (isToday) {
+      const hit = hlCache.get(rid);
+      if (!hit || Date.now() - hit.at >= 60000) {
+        try {
+          await pullHighlights(rid);
+          live = true;
+        } catch (e) {
+          err = e.message;
+        }
+      }
     }
+    const list = store.highlightsOfDay({ rid, from, to })
+      .filter((x) => x.start >= from && x.start < to)
+      .sort((a, b) => b.start - a.start);
+    return json(res, 200, { ok: true, rid, date, live, error: err || undefined, count: list.length, list });
   }
 
   // 时间线框选：一段时间内出现过的说法，按重复次数降序
