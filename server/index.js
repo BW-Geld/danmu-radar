@@ -13,6 +13,7 @@ const { normalize } = require('./text');
 const analysis = require('./analysis');
 const lexicon = require('./lexicon');
 const vod = require('./vod');
+const douyu = require('./douyu');
 const library = require('./library');
 const { PRESETS } = require('./affixes');
 const COPY = require('../shared/copy');
@@ -216,6 +217,8 @@ setInterval(autoFloods, 60 * 1000).unref();
 // ---------------------------------------------------------------- SSE
 
 const clients = new Set();
+// 看点列表的短期缓存：key=rid，value={ at, data }
+const hlCache = new Map();
 // 关窗口即停采集：只要界面连过、又全部断开，就开始倒计时
 let uiAttached = false;
 let graceSince = 0;
@@ -508,6 +511,22 @@ async function handleApi(req, res, url) {
       if (r.c > max) max = r.c;
     }
     return json(res, 200, { ok: true, date, from, to, bucketMs, total, max, buckets });
+  }
+
+  // 本场「AI 看点」：转斗鱼的 getHighlightDetail，60 秒内存缓存（它每次都会新生成，别打太勤）
+  if (p === '/highlights' && req.method === 'GET') {
+    const rid = Number(q.get('rid')) || 0;
+    if (!rid) return json(res, 400, { ok: false, error: '缺少 rid' });
+    const hit = hlCache.get(rid);
+    if (hit && Date.now() - hit.at < 60000) return json(res, 200, { ok: true, cached: true, ...hit.data });
+    try {
+      const list = await douyu.fetchHighlights(rid);
+      const data = { rid, list, took: 0 };
+      hlCache.set(rid, { at: Date.now(), data });
+      return json(res, 200, { ok: true, cached: false, ...data });
+    } catch (err) {
+      return json(res, 200, { ok: false, rid, error: err.message, list: [] });
+    }
   }
 
   // 时间线框选：一段时间内出现过的说法，按重复次数降序

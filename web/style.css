@@ -775,3 +775,16 @@ pre.code {
 .tl-wrap { position: relative; }
 #t-canvas { display: block; width: 100%; height: 150px; cursor: crosshair; touch-action: none; border-radius: 8px; }
 .tl-axis { height: 16px; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+/* 时间线：本场看点 */
+.hl-row {
+  display: flex;
+  gap: 10px;
+  padding: 7px 4px;
+  border-top: 1px solid var(--line);
+  cursor: pointer;
+}
+.hl-row:hover { background: rgba(77, 224, 176, .06); }
+.hl-time { color: var(--muted); font-variant-numeric: tabular-nums; flex: 0 0 66px; font-size: 12px; padding-top: 2px; }
+.hl-main { min-width: 0; }
+.hl-title { font-size: 13px; }
+.hl-desc { margin-top: 2px; line-height: 1.5; }

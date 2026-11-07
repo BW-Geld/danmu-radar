@@ -2807,11 +2807,68 @@ function renderTimelineRows(d, range) {
   box.append(frag);
 }
 
+// 本场看点：斗鱼 AI 生成的片段，接口要房间正在播才有内容
+async function loadHighlights() {
+  const card = $('#t-hl-card');
+  const listBox = $('#t-hl-list');
+  const count = $('#t-hl-count');
+  const rid = $('#t-rid').value;
+  if (!rid) {
+    card.hidden = true;
+    return;
+  }
+  card.hidden = false;
+  count.textContent = '加载中…';
+  listBox.textContent = '';
+  try {
+    const d = await api(`/api/highlights?rid=${rid}`);
+    if (!d.ok) {
+      count.textContent = '取不到：' + (d.error || '斗鱼没返回数据');
+      return;
+    }
+    count.textContent = `共 ${d.list.length} 条`;
+    if (!d.list.length) {
+      listBox.append(h('p', 'hint muted small', '这一场还没有看点。'));
+      return;
+    }
+    const frag = document.createDocumentFragment();
+    for (const it of d.list) {
+      const row = h('div', 'hl-row');
+      const time = h('div', 'hl-time', fmtTime(it.start));
+      const main = h('div', 'hl-main');
+      main.append(h('div', 'hl-title', it.title || '（无标题）'));
+      const sub = [it.desc, it.summary].find((s) => s && s !== it.title) || '';
+      if (sub) main.append(h('div', 'hl-desc muted small', sub));
+      row.append(time, main);
+      row.addEventListener('click', () => {
+        const end = it.end > it.start ? it.end : it.start + 3 * 60000;
+        const d0 = tl.data;
+        if (!d0 || it.start < d0.from || it.start >= d0.to) {
+          toast('这条看点不在当前选中的日期里', true);
+          return;
+        }
+        const sel = tlSelFromRange({ from: it.start, to: end });
+        if (!sel) return;
+        tl.sel = sel;
+        tlSaveSel();
+        tlDraw();
+        tlCommit();
+        $('#t-hl-card').scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      });
+      frag.append(row);
+    }
+    listBox.append(frag);
+  } catch (err) {
+    count.textContent = '看点加载失败：' + err.message;
+  }
+}
+
 async function loadTimeline() {
   const dateInput = $('#t-date');
   if (!dateInput.value) dateInput.value = fmtDate(Date.now());
   const rid = $('#t-rid').value;
   const readout = $('#t-readout');
+  loadHighlights();
   try {
     const d = await api(`/api/timeline?date=${dateInput.value}${rid ? '&rid=' + rid : ''}`);
     tl.data = d;
@@ -3045,6 +3102,7 @@ function tlEdgeAt(ev) {
   });
   $('#t-date').addEventListener('change', loadTimeline);
   $('#t-rid').addEventListener('change', loadTimeline);
+  $('#t-hl-refresh').addEventListener('click', loadHighlights);
   $('#t-min2').addEventListener('change', () => {
     if (tl.sel) tlCommit();
   });

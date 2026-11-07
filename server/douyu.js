@@ -254,7 +254,7 @@ class DanmuClient extends EventEmitter {
                 at: Date.now(),
                 rid: this.rid,
                 type: String(m.type || ''),
-                preview: JSON.stringify(m).slice(0, 300),
+                preview: JSON.stringify(m).slice(0, 4000),
               });
               fs.appendFileSync(WS_LOG_FILE, line + '\n');
             } catch {}
@@ -296,4 +296,38 @@ class DanmuClient extends EventEmitter {
   }
 }
 
-module.exports = { fetchRoomInfo, DanmuClient, PORTS, HOST, toMs };
+/**
+ * 拉本场「AI 看点」列表。
+ * 接口是 vodnc 下的 getHighlightDetail，用 form 提交，只要 rid，hlId 传 0 也返回整场列表。
+ * 返回的 highlightList 每项含 highlightId / title / summary / describe / startTime / endTime / heat。
+ */
+async function fetchHighlights(rid) {
+  const res = await fetch('https://www.douyu.com/wgapi/vodnc/center/ailive/getHighlightDetail', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/x-www-form-urlencoded',
+      Referer: `https://www.douyu.com/${rid}`,
+      'User-Agent': UA,
+    },
+    body: new URLSearchParams({ rid: String(rid), hlId: '0' }),
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!res.ok) throw new Error(`看点接口 HTTP ${res.status}`);
+  const json = await res.json();
+  if (json.error !== 0) throw new Error(json.msg || '看点接口返回错误');
+  const list = (json.data && json.data.highlightList) || [];
+  return list
+    .map((x) => ({
+      id: String(x.highlightId || ''),
+      title: String(x.title || ''),
+      summary: String(x.summary || ''),
+      desc: String(x.describe || ''),
+      start: Number(x.startTime || 0) * 1000,
+      end: Number(x.endTime || 0) * 1000,
+      heat: Number(x.heat || 0),
+    }))
+    .filter((x) => x.start > 0)
+    .sort((a, b) => a.start - b.start);
+}
+
+module.exports = { fetchRoomInfo, fetchHighlights, DanmuClient, PORTS, HOST, toMs };
