@@ -730,6 +730,119 @@ function renderSummary(d) {
   box.append(h('span', 'tag', `${d.took} ms`));
 }
 
+// ------------------------------------------------------------ 检索结果展开（首发 / 谁在发）
+// origin 查询快、senders 查询慢：拆开请求，origin 先渲染，senders 后到再补。
+// 结果按说法缓存在这一轮检索里，收起再展开不重复打接口。
+function paintOrigin(box, o, err) {
+  box.textContent = '';
+  if (err) {
+    box.append(h('p', 'origin-line', `${COPY.DETAIL.originFailed}（${err.message}）`));
+    return;
+  }
+  if (!o) {
+    box.append(h('p', 'origin-line', COPY.DETAIL.originLoading));
+    return;
+  }
+  if (!o.ok) {
+    box.append(h('p', 'origin-line', o.error || COPY.DETAIL.originEmpty));
+    return;
+  }
+  const f = o.first || {};
+  const line = h('p', 'origin-line');
+  line.append(document.createTextNode(COPY.fill(COPY.DETAIL.originWho, { who: f.nn || f.uid || '—' })));
+  if (f.cst) {
+    const when = h('button', 'when-link', fmtTime(f.cst));
+    when.title = '在时间线里看这前后 5 分钟';
+    when.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      jumpToTimeline(Number(f.cst) - 150000, Number(f.cst) + 150000, f.rid);
+    });
+    line.append(when);
+  } else {
+    line.append(document.createTextNode('—'));
+  }
+  line.append(document.createTextNode(` · ${sourceName(f.source)}`));
+  box.append(line);
+  box.append(
+    h(
+      'p',
+      'origin-line',
+      COPY.fill(COPY.DETAIL.originStats, {
+        total: fmtNum(o.total),
+        users: fmtNum(o.users),
+        plusOne: fmtNum(o.plusOne),
+        floods: fmtNum(o.floods),
+      })
+    )
+  );
+  box.append(h('p', 'hint', o.note || ''));
+}
+
+function paintSenders(box, s, err) {
+  box.textContent = '';
+  if (err) {
+    box.append(h('p', 'origin-line', `${COPY.DETAIL.sendersFailed}（${err.message}）`));
+    return;
+  }
+  if (!s) {
+    box.append(h('p', 'origin-line', COPY.DETAIL.sendersLoading));
+    return;
+  }
+  if (!s.ok) {
+    box.append(h('p', 'origin-line', s.error || COPY.DETAIL.sendersEmpty));
+    return;
+  }
+  const list = s.senders || [];
+  if (!list.length) {
+    box.append(h('p', 'origin-line', COPY.DETAIL.sendersEmpty));
+    return;
+  }
+  const wrap = h('div', 'senders');
+  wrap.append(h('p', 'origin-line', COPY.fill(COPY.DETAIL.sendersTitle, { n: list.length })));
+  for (const p of list) {
+    const chip = h('button', 'sender-chip', `${p.nn || p.uid}${p.n > 1 ? ' ×' + p.n : ''}`);
+    chip.title = `${fmtTime(p.first)} ~ ${fmtTime(p.last)}`;
+    chip.addEventListener('click', () => openUser(p.uid));
+    wrap.append(chip);
+  }
+  box.append(wrap);
+}
+
+function paintDetail(ent, detail) {
+  const originBox = h('div', 'origin-part');
+  paintOrigin(originBox, ent.o, ent.oErr);
+  const sendersBox = h('div', 'senders-part');
+  paintSenders(sendersBox, ent.s, ent.sErr);
+  detail.textContent = '';
+  detail.append(originBox, sendersBox);
+}
+
+function loadDetail(ent, key, detail) {
+  ent.loading = true;
+  const originReq = api(`/api/origin?txt=${encodeURIComponent(key)}`)
+    .then((o) => {
+      ent.o = o;
+      if (detail.isConnected && detail.dataset.open === '1') paintDetail(ent, detail);
+    })
+    .catch((err) => {
+      ent.oErr = err;
+      if (detail.isConnected && detail.dataset.open === '1') paintDetail(ent, detail);
+    });
+  const sendersReq = api(`/api/senders?stem=${encodeURIComponent(key)}&limit=12`)
+    .then((s) => {
+      ent.s = s;
+      if (detail.isConnected && detail.dataset.open === '1') paintDetail(ent, detail);
+    })
+    .catch((err) => {
+      ent.sErr = err;
+      if (detail.isConnected && detail.dataset.open === '1') paintDetail(ent, detail);
+    });
+  ent.promise = Promise.all([originReq, sendersReq]).then(() => {
+    ent.loading = false;
+    if (detail.isConnected && detail.dataset.open === '1') paintDetail(ent, detail);
+  });
+}
+
 function renderResults(d) {
   const box = $('#s-results');
   box.textContent = '';
@@ -742,6 +855,8 @@ function renderResults(d) {
     return;
   }
   const frag = document.createDocumentFragment();
+  // 这一轮检索的展开缓存：key = 说法，收起再展开直接复用
+  const detailCache = new Map();
   for (const r of list) {
     const row = h('div', 'result');
     const who = h('div', 'who');
@@ -767,65 +882,26 @@ function renderResults(d) {
     if (r.badge) why.append(document.createTextNode(` · ${r.badge}`));
 
     const detail = h('div', 'origin-box');
-    const ask = h('button', 'origin-btn', '展开');
-    ask.title = '看谁在发、本库最早是谁';
-    ask.addEventListener('click', async () => {
+    const ask = h('button', 'origin-btn', COPY.DETAIL.expand);
+    ask.title = COPY.DETAIL.title;
+    const key = r.stem || r.txt || String(r.id || '');
+    ask.addEventListener('click', () => {
       if (detail.dataset.open === '1') {
         detail.dataset.open = '0';
         detail.textContent = '';
-        ask.textContent = '展开';
+        ask.textContent = COPY.DETAIL.expand;
         return;
       }
-      ask.textContent = '查询中…';
-      try {
-        const [o, s] = await Promise.all([
-          api(`/api/origin?txt=${encodeURIComponent(r.stem || r.txt)}`),
-          api(`/api/senders?stem=${encodeURIComponent(r.stem || r.txt)}&limit=12`),
-        ]);
-        detail.textContent = '';
-        if (o.ok) {
-          const f = o.first || {};
-          const line = h('p', 'origin-line');
-          line.append(document.createTextNode(`本库最早：${f.nn || f.uid} · `));
-          if (f.cst) {
-            const when = h('button', 'when-link', fmtTime(f.cst));
-            when.title = '在时间线里看这前后 5 分钟';
-            when.addEventListener('click', (ev) => {
-              ev.stopPropagation();
-              jumpToTimeline(Number(f.cst) - 150000, Number(f.cst) + 150000, f.rid);
-            });
-            line.append(when);
-          } else {
-            line.append(document.createTextNode('—'));
-          }
-          line.append(document.createTextNode(` · ${sourceName(f.source)}`));
-          detail.append(line);
-          detail.append(
-            h(
-              'p',
-              'origin-line',
-              `共 ${fmtNum(o.total)} 条 / ${fmtNum(o.users)} 人 · 其中被 +1 ${fmtNum(o.plusOne)} 次 · 弹幕潮 ${fmtNum(o.floods)} 次`
-            )
-          );
-          detail.append(h('p', 'hint', o.note || ''));
-        }
-        if (s.ok && s.senders.length) {
-          const wrap = h('div', 'senders');
-          wrap.append(h('p', 'origin-line', `谁在发（${s.senders.length} 人）：`));
-          for (const p of s.senders) {
-            const chip = h('button', 'sender-chip', `${p.nn || p.uid}${p.n > 1 ? ' ×' + p.n : ''}`);
-            chip.title = `${fmtTime(p.first)} ~ ${fmtTime(p.last)}`;
-            chip.addEventListener('click', () => openUser(p.uid));
-            wrap.append(chip);
-          }
-          detail.append(wrap);
-        }
-        detail.dataset.open = '1';
-        ask.textContent = '收起';
-      } catch (err) {
-        ask.textContent = '展开';
-        toast(err.message);
+      detail.dataset.open = '1';
+      ask.textContent = COPY.DETAIL.collapse;
+      let ent = detailCache.get(key);
+      if (!ent) {
+        ent = {};
+        detailCache.set(key, ent);
       }
+      paintDetail(ent, detail);
+      const settled = (ent.o !== undefined || ent.oErr) && (ent.s !== undefined || ent.sErr);
+      if (!ent.loading && !settled) loadDetail(ent, key, detail);
     });
     body.append(why, ask, detail);
     const tm = h('div', 'tm', r.n > 1 ? `${fmtTime(r.last)} 最后` : fmtTime(r.cst || r.last));
@@ -2039,7 +2115,49 @@ async function loadSettings() {
 // ------------------------------------------------------------ 收藏夹
 const fav = { items: [], keys: new Set() };
 
+// 收藏夹排序：只在前端重排，不额外请求；刷新页面回默认
+const favSort = { by: 'time', dir: 'desc' };
+
 const favKey = (r) => `${Number(r.rid)}|${r.stem || r.txt || ''}`;
+
+/** +1 = 同一种说法的条数 − 1；老服务没返回 plusOne 时兜底算一遍 */
+function favPlusOne(f) {
+  if (f.plusOne !== undefined && f.plusOne !== null) return Math.max(0, Number(f.plusOne) || 0);
+  return Math.max(0, (Number(f.hits) || 0) - 1);
+}
+
+function sortFavorites(items) {
+  const sign = favSort.dir === 'asc' ? 1 : -1;
+  items.sort((a, b) => {
+    const av = favSort.by === 'plus1' ? favPlusOne(a) : Number(a.created_at) || 0;
+    const bv = favSort.by === 'plus1' ? favPlusOne(b) : Number(b.created_at) || 0;
+    if (av !== bv) return (av - bv) * sign;
+    // 并列时固定按收藏时间倒序、id 倒序兜底，正序/倒序都不打乱同值项的先后
+    const at = Number(a.created_at) || 0;
+    const bt = Number(b.created_at) || 0;
+    if (at !== bt) return bt - at;
+    return (Number(b.id) || 0) - (Number(a.id) || 0);
+  });
+  return items;
+}
+
+function initFavSort() {
+  const label = $('#f-sort-label');
+  if (label) label.textContent = COPY.FAV.sortBy;
+  const sel = $('#f-sort');
+  if (sel) {
+    sel.textContent = '';
+    sel.append(new Option(COPY.FAV.byTime, 'time'), new Option(COPY.FAV.byPlus1, 'plus1'));
+    sel.value = favSort.by;
+  }
+  const dir = $('#f-dir');
+  if (dir) {
+    dir.textContent = favSort.dir === 'desc' ? COPY.FAV.desc : COPY.FAV.asc;
+    dir.title = COPY.FAV.dirTitle;
+  }
+  const hint = $('#f-plus1-hint');
+  if (hint) hint.textContent = COPY.FAV.plus1Hint;
+}
 
 function syncFavKeys() {
   fav.keys = new Set(fav.items.map((f) => `${Number(f.rid)}|${f.stem}`));
@@ -2097,6 +2215,7 @@ async function toggleFavorite(r) {
       created_at: Date.now(),
       hits: r.n || 0,
       users: r.users || 0,
+      plusOne: Math.max(0, (Number(r.n) || 0) - 1),
     });
     if (realRid !== Number(r.rid)) {
       const nextKey = `${realRid}|${r.stem || r.txt}`;
@@ -2169,10 +2288,10 @@ function renderFavorites() {
   box.textContent = '';
   const ridSel = $('#f-rid');
   const want = ridSel && ridSel.value ? Number(ridSel.value) : 0;
-  const items = fav.items.filter((f) => !want || Number(f.rid) === want);
+  const items = sortFavorites(fav.items.filter((f) => !want || Number(f.rid) === want));
 
   const cnt = $('#f-count');
-  if (cnt) cnt.textContent = items.length ? `共 ${items.length} 条收藏` : '';
+  if (cnt) cnt.textContent = items.length ? COPY.fill(COPY.FAV.count, { n: items.length }) : '';
 
   if (!items.length) {
     const empty = h('div', 'empty');
@@ -2193,6 +2312,7 @@ function renderFavorites() {
     sub.append(h('span', null, it.live_room_name || it.room_name || `#${it.rid}`));
     sub.append(h('span', null, `收藏于 ${fmtDate(it.created_at)} ${fmtTime(it.created_at)}`));
     if (it.hits) sub.append(h('span', null, `现在 ${fmtNum(it.hits)} 条 · ${fmtNum(it.users)} 人`));
+    sub.append(h('span', 'fav-plus1', COPY.fill(COPY.FAV.plusOne, { n: fmtNum(favPlusOne(it)) })));
     main.append(sub);
     row.append(main);
 
@@ -2214,8 +2334,18 @@ function renderFavorites() {
   }
 }
 
+initFavSort();
 $('#f-refresh').addEventListener('click', loadFavorites);
 $('#f-rid').addEventListener('change', renderFavorites);
+$('#f-sort').addEventListener('change', () => {
+  favSort.by = $('#f-sort').value === 'plus1' ? 'plus1' : 'time';
+  renderFavorites();
+});
+$('#f-dir').addEventListener('click', () => {
+  favSort.dir = favSort.dir === 'desc' ? 'asc' : 'desc';
+  initFavSort();
+  renderFavorites();
+});
 
 // ------------------------------------------------------------ 库包导出 / 导入
 

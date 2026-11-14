@@ -253,8 +253,13 @@
         <button class="btn ghost" id="f-refresh">刷新</button>
         <span class="hint" id="f-count"></span>
       </div>
+      <div class="row-inline fav-tools" style="margin-top:8px">
+        <label class="hint" id="f-sort-label" for="f-sort"></label>
+        <select id="f-sort" class="select"></select>
+        <button class="btn ghost tiny" id="f-dir" type="button"></button>
+      </div>
       <p class="hint" style="margin-top:8px">
-        收藏的是「说法」，不是某一条。点说法直接去检索；后面的条数/人数是<strong>现在</strong>的数，会随采集变化。
+        收藏的是「说法」，不是某一条。点说法直接去检索；后面的条数/人数是<strong>现在</strong>的数，会随采集变化。 <span id="f-plus1-hint"></span>
       </p>
     </div>
     <div id="f-list" class="fav-list"></div>

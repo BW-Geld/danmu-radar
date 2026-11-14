@@ -1,4 +1,4 @@
-﻿:root {
+:root {
   --bg: #0b0e13;
   --panel: #12171f;
   --panel-2: #161d27;
@@ -244,6 +244,8 @@ code {
 }
 .fav-title:hover { color: var(--accent); text-decoration: underline; }
 .fav-sub { display: flex; gap: 12px; margin-top: 4px; font-size: 11px; color: var(--muted); }
+.fav-plus1 { font-variant-numeric: tabular-nums; }
+.fav-tools { flex-wrap: wrap; }
 .btn.tiny { padding: 3px 10px; font-size: 11px; }
 .origin-box:empty { display: none; }
 .origin-box {

@@ -52,6 +52,35 @@
       chat: '日常闲聊',
     },
 
+    /** 检索结果展开：首发 / 谁在发 */
+    DETAIL: {
+      title: '看谁在发、本库最早是谁',
+      expand: '展开',
+      collapse: '收起',
+      originLoading: '本库最早：查询中…',
+      originEmpty: '本库最早：本地没有记录',
+      originFailed: '本库最早：加载失败',
+      sendersLoading: '谁在发：加载中…',
+      sendersEmpty: '谁在发：本地没有记录',
+      sendersFailed: '谁在发：加载失败',
+      sendersTitle: '谁在发（{n} 人）：',
+      originWho: '本库最早：{who} · ',
+      originStats: '共 {total} 条 / {users} 人 · 其中被 +1 {plusOne} 次 · 弹幕潮 {floods} 次',
+    },
+
+    /** 收藏夹：排序与 +1 口径 */
+    FAV: {
+      sortBy: '排序',
+      byTime: '收藏时间',
+      byPlus1: '被 +1 数',
+      desc: '倒序 ↓',
+      asc: '正序 ↑',
+      dirTitle: '切换正序 / 倒序',
+      count: '共 {n} 条收藏',
+      plusOne: '+1 {n}',
+      plus1Hint: '「+1」= 同一种说法的跟发次数（总条数 − 1）。',
+    },
+
     /** 填 {key} 占位符；缺失的键原样保留，方便测试发现漏填 */
     fill(tpl, vars) {
       return String(tpl == null ? '' : tpl).replace(/\{(\w+)\}/g, (all, key) =>

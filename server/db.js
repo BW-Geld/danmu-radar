@@ -223,6 +223,9 @@ function open(dbPath = DB_PATH) {
   }
   db.exec('CREATE INDEX IF NOT EXISTS idx_msg_topic ON messages(rid, topic, cst)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_msg_stem  ON messages(rid, stem, cst)');
+  // 检索结果「展开」查的是跨房间的说法（不带 rid），上面那个索引第一列是 rid，
+  // 用不上；这里按 stem 打头再建一个，查询计划才能走索引而不是全表扫。
+  db.exec('CREATE INDEX IF NOT EXISTS idx_msg_stem_all ON messages(stem, cst)');
   // 唯一索引放在迁移之后建：老库此时才刚补上 ext 列
   db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_msg_ext ON messages(ext) WHERE ext IS NOT NULL');
 
@@ -1034,23 +1037,28 @@ class Store {
     return r.changes > 0;
   }
 
-  /** 收藏列表：顺带把「现在有多少条 / 多少人」算出来，方便看这句还热不热 */
-  listFavorites({ rid = 0, limit = 200 } = {}) {
+  /** 收藏列表：顺带把「现在有多少条 / 多少人 / 被 +1 几次」算出来，方便看这句还热不热 */
+  listFavorites({ rid = 0 } = {}) {
     const where = rid ? 'WHERE f.rid = ?' : '';
     const args = rid ? [Number(rid)] : [];
-    return this.db
+    const rows = this.db
       .prepare(
         `SELECT f.*, r.name AS live_room_name,
                 (SELECT COUNT(*) FROM messages m
-                  WHERE m.rid = f.rid AND COALESCE(NULLIF(m.stem,''), m.txt) = f.stem AND m.kind='chat') AS hits,
+                  WHERE m.rid = f.rid
+                    AND (m.stem = f.stem OR ((m.stem IS NULL OR m.stem = '') AND m.txt = f.stem))
+                    AND m.kind = 'chat') AS hits,
                 (SELECT COUNT(DISTINCT m.uid) FROM messages m
-                  WHERE m.rid = f.rid AND COALESCE(NULLIF(m.stem,''), m.txt) = f.stem AND m.kind='chat') AS users
+                  WHERE m.rid = f.rid
+                    AND (m.stem = f.stem OR ((m.stem IS NULL OR m.stem = '') AND m.txt = f.stem))
+                    AND m.kind = 'chat') AS users
            FROM favorites f LEFT JOIN rooms r ON r.rid = f.rid
            ${where}
-          ORDER BY f.created_at DESC
-          LIMIT ?`
+          ORDER BY f.created_at DESC`
       )
-      .all(...args, Number(limit));
+      .all(...args);
+    // 排序需要全量列表，不能再截 200 条；+1 与排行榜口径一致：同说法条数 − 1（第一条是首发）
+    return rows.map((r) => ({ ...r, plusOne: Math.max(0, Number(r.hits) - 1) }));
   }
 
   isFavorite(rid, stem) {
@@ -1231,8 +1239,10 @@ class Store {
 
   /** 某句话是哪些人在发：按人聚合，给「重复」一个可核对的下钻。 */
   sendersOfStem(g, { rid = 0, limit = 20 } = {}) {
-    const where = ["COALESCE(NULLIF(stem, ''), txt) = ?", "kind = 'chat'"];
-    const args = [String(g)];
+    // 跨房间查询用不上 idx_msg_stem（第一列是 rid）；写成「stem 命中，空 stem 再看 txt」
+    // 才能走 idx_msg_stem_all 的 MULTI-INDEX OR。别改回 COALESCE 表达式：那样会全表扫。
+    const where = ["(stem = ? OR ((stem IS NULL OR stem = '') AND txt = ?))", "kind = 'chat'"];
+    const args = [String(g), String(g)];
     if (rid) {
       where.push('rid = ?');
       args.push(Number(rid));

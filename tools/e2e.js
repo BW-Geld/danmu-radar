@@ -241,6 +241,11 @@ async function post(path, body) {
   const favList = await j('/api/favorites');
   const got = (favList.data.items || []).find((x) => x.stem === favStem);
   check('GET /api/favorites 能查到，并带上现在的条数/人数', !!got && 'hits' in got && 'users' in got, got ? `hits=${got.hits}` : '没查到');
+  check(
+    'GET /api/favorites 的 +1 = hits − 1',
+    !!got && Number.isFinite(Number(got.plusOne)) && Number(got.plusOne) === Math.max(0, Number(got.hits) - 1),
+    got ? `plusOne=${got.plusOne} hits=${got.hits}` : '没查到'
+  );
   const favDel = await j(`/api/favorites/${favAdd.data.id}`, { method: 'DELETE' });
   check('DELETE /api/favorites/:id 能取消', favDel.status === 200 && favDel.data.removed === true);
 
