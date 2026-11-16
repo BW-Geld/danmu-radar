@@ -16,6 +16,17 @@ const DIST = path.join(ROOT, 'dist');
 const NAME = '弹幕雷达-便携版';
 const OUT = path.join(DIST, NAME);
 
+// 版本号只维护这一处：打包、归档、发布都从 VERSION 读，避免文件名和文档各写一份。
+const VERSION_FILE = path.join(ROOT, 'VERSION');
+if (!fs.existsSync(VERSION_FILE)) {
+  throw new Error('找不到 VERSION 文件（项目根目录，内容形如 0.3.1）');
+}
+const VERSION = fs.readFileSync(VERSION_FILE, 'utf8').trim();
+if (!/^\d+\.\d+\.\d+$/.test(VERSION)) {
+  throw new Error(`VERSION 内容不合法：${VERSION}（应形如 0.3.1）`);
+}
+const ZIP_NAME = `danmu-radar-portable-v${VERSION}.zip`;
+
 const START_BAT = `@echo off
 cd /d "%~dp0"
 title Danmu Radar - debug console
@@ -162,10 +173,35 @@ if (fs.existsSync(LAUNCHER_SRC)) {
   return OUT;
 }
 
+function archiveStamp() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+
+function archiveOldZips() {
+  // dist 根目录只留最新包；旧包按原名进 archive，重名时加时间戳保留历史。
+  const archive = path.join(DIST, 'archive');
+  fs.mkdirSync(archive, { recursive: true });
+  const stamp = archiveStamp();
+  for (const name of fs.readdirSync(DIST)) {
+    if (!/^danmu-radar-portable.*\.zip$/i.test(name)) continue;
+    const src = path.join(DIST, name);
+    if (!fs.statSync(src).isFile()) continue;
+    let dest = path.join(archive, name);
+    if (fs.existsSync(dest)) {
+      dest = path.join(archive, `${path.basename(name, '.zip')}-${stamp}.zip`);
+    }
+    fs.renameSync(src, dest);
+    console.log(`已归档旧包 ${name} -> ${dest}`);
+  }
+}
+
 function zip(dir) {
   // zip 的名字必须全 ASCII：GitHub 上传附件时会把文件名里的非 ASCII 字符直接删掉，
   // 「弹幕雷达-便携版.zip」会变成「-.zip」，所以包名用英文，中文写在 Release 标题里。
-  const target = path.join(DIST, 'danmu-radar-portable.zip');
+  archiveOldZips();
+  const target = path.join(DIST, ZIP_NAME);
   fs.rmSync(target, { force: true });
   execFileSync(
     'powershell',
@@ -177,7 +213,7 @@ function zip(dir) {
     { stdio: 'inherit' }
   );
   const mb = (fs.statSync(target).size / 1048576).toFixed(1);
-  console.log(`已压缩 ${target}（${mb} MB）`);
+  console.log(`已压缩 ${target}（${mb} MB，v${VERSION}）`);
   return target;
 }
 
