@@ -91,7 +91,8 @@ function build() {
       hadData = true;
     }
   } catch (err) {
-    console.log(`  [!] 没法暂存 dist\\data（${err.message}），这次跳过保留`);
+    // 绝对不能“跳过保留”继续构建：下面会 rmSync(OUT)，真的会把用户的数据库删掉。
+    throw new Error(`没法暂存 dist\\data（${err.message}）；请先停止正在运行的服务再打包，避免删除用户数据库`);
   }
 
   fs.rmSync(OUT, { recursive: true, force: true });
