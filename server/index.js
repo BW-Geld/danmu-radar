@@ -3,6 +3,7 @@
 /** 本地 HTTP 服务：REST API + SSE 实时推送 + 静态页面。 */
 
 const http = require('node:http');
+const { once } = require('node:events');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -132,14 +133,14 @@ loadUserLexicon();
 let RETENTION_DAYS = Number(process.env.DANMU_RETENTION || store.metaGet('retentionDays') || 90);
 if (!Number.isFinite(RETENTION_DAYS) || RETENTION_DAYS < 0) RETENTION_DAYS = 90;
 
-function autoPrune() {
+async function autoPrune() {
   try {
     if (RETENTION_DAYS <= 0) {
       // 永久保留：仍然记一次检查时间，界面上能看出定时器是活的
       store.metaSet('last_prune_at', String(Date.now()));
       return;
     }
-    const removed = store.prune(RETENTION_DAYS);
+    const removed = await store.prune(RETENTION_DAYS);
     store.metaSet('last_prune_at', String(Date.now()));
     if (removed > 0) console.log(`[维护] 自动清理 ${removed} 条超过 ${RETENTION_DAYS} 天的弹幕`);
   } catch (err) {
@@ -162,7 +163,9 @@ function runtimeInfo() {
   }
   return {
     sseClients: clients.size,
+    sseDropped: sseDroppedClients,
     buffered: (collector.buffer || []).length,
+    bufferDropped: collector.overflowDropped || 0,
     dropped: collector.dropped || 0,
     replayDropped: collector.replayDropped || 0,
     lateFrames,
@@ -226,6 +229,10 @@ setInterval(() => {
 // ---------------------------------------------------------------- SSE
 
 const clients = new Set();
+// 慢客户端保护：Node 的 res.write() 不等人，客户端不读时会在进程里越堆越多。
+// 超过 2MB 未发完就直接断开这条 SSE，让前端重连后重新拉快照，宁可丢实时帧也不拖垮服务。
+const SSE_MAX_BUFFER = 2 * 1024 * 1024;
+let sseDroppedClients = 0;
 // 看点列表的短期缓存：key=rid，value={ at }
 const hlCache = new Map();
 // 每个房间上一次看到的开播状态，用来判断「刚刚下播」：1=在播、其它=下播
@@ -342,16 +349,41 @@ function roomListFull() {
   return list;
 }
 
-function sseSend(res, event, data) {
+function sseWrite(res, payload) {
+  if (res.destroyed || res.writableEnded) {
+    clients.delete(res);
+    return;
+  }
+  if ((res.writableLength || 0) > SSE_MAX_BUFFER) {
+    sseDroppedClients++;
+    clients.delete(res);
+    try {
+      res.destroy();
+    } catch {
+      /* 已断开 */
+    }
+    return;
+  }
   try {
-    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    res.write(payload);
   } catch {
-    /* 断开的连接由 close 事件清理 */
+    clients.delete(res);
+    try {
+      res.destroy();
+    } catch {
+      /* 已断开 */
+    }
   }
 }
 
+function sseSend(res, event, data) {
+  sseWrite(res, `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+}
+
 function broadcast(event, data) {
-  for (const res of clients) sseSend(res, event, data);
+  // 同一个事件只序列化一次；慢客户端由 sseWrite 统一处理背压。
+  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const res of clients) sseWrite(res, payload);
 }
 
 collector.on('messages', (rows) => {
@@ -364,6 +396,10 @@ collector.on('messages', (rows) => {
 
 collector.on('rooms', () => broadcast('rooms', roomListFull()));
 collector.on('status', (st) => broadcast('status', st));
+collector.on('overflow', (info) => {
+  console.warn(`[采集] 落库缓冲已满，丢弃最老 ${info.dropped} 条（累计 ${info.total} 条）`);
+  broadcast('overflow', info);
+});
 
 // 库文件被外部删掉/挪走：采集已停，这里要把话说清楚——写日志、推给界面。
 collector.on('dbgone', (err) => {
@@ -428,22 +464,27 @@ function sendCsv(res, filename, rows) {
   res.end(body);
 }
 
-function readRawBody(req, limit = 512 * 1024 * 1024) {
-  return new Promise((resolve, reject) => {
-    let size = 0;
-    const chunks = [];
-    req.on('data', (c) => {
-      size += c.length;
+/** 把请求体流式落盘，避免 512MB 库包先整块进内存。 */
+async function receiveFile(req, dest, limit = 512 * 1024 * 1024) {
+  const out = fs.createWriteStream(dest);
+  let size = 0;
+  try {
+    for await (const chunk of req) {
+      size += chunk.length;
       if (size > limit) {
-        reject(new Error('文件太大'));
         req.destroy();
-        return;
+        throw new Error('文件太大');
       }
-      chunks.push(c);
-    });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
-  });
+      if (!out.write(chunk)) await once(out, 'drain');
+    }
+    out.end();
+    await once(out, 'finish');
+    return size;
+  } catch (err) {
+    out.destroy();
+    await fs.promises.rm(dest, { force: true }).catch(() => {});
+    throw err;
+  }
 }
 
 function readBody(req, limit = 1 << 20) {
@@ -504,10 +545,12 @@ async function handleApi(req, res, url) {
 
   // 概览
   if (p === '/stats' && req.method === 'GET') {
+    // stats() 已经算过 first/last/total；coverage 再扫一遍全表等于让缓存白做。
+    const s = store.stats();
     return json(res, 200, {
       ok: true,
-      ...store.stats(),
-      coverage: store.coverage(),
+      ...s,
+      coverage: store.coverage({ known: s }),
       runtime: runtimeInfo(),
       rooms: roomListFull(),
     });
@@ -709,10 +752,19 @@ async function handleApi(req, res, url) {
   if (p === '/affixes' && req.method === 'POST') {
     const body = await readBody(req);
     const t0 = Date.now();
-    const out = store.applyAffixes({
-      prefixes: Array.isArray(body.prefixes) ? body.prefixes : [],
-      suffixes: Array.isArray(body.suffixes) ? body.suffixes : [],
-    });
+    let out;
+    try {
+      out = await store.applyAffixes(
+        {
+          prefixes: Array.isArray(body.prefixes) ? body.prefixes : [],
+          suffixes: Array.isArray(body.suffixes) ? body.suffixes : [],
+        },
+        { onProgress: (x) => broadcast('affixprogress', x) }
+      );
+    } catch (err) {
+      if (err.code === 'AFFIX_BUSY') return json(res, 409, { ok: false, error: err.message });
+      throw err;
+    }
     return json(res, 200, { ok: true, ...out, took: Date.now() - t0 });
   }
 
@@ -1003,7 +1055,7 @@ async function handleApi(req, res, url) {
     if (!Number.isFinite(days)) return json(res, 400, { ok: false, error: 'retentionDays 需要是 0 或正整数' });
     store.metaSet('retentionDays', String(days));
     RETENTION_DAYS = days;
-    const removed = days > 0 ? store.prune(days) : 0;
+    const removed = days > 0 ? await store.prune(days) : 0;
     if (days === 0) console.log('[维护] 已改为永久保留，不再自动清理');
     return json(res, 200, { ok: true, removed, retentionDays: days });
   }
@@ -1085,17 +1137,50 @@ async function handleApi(req, res, url) {
 
   // 导入：请求体就是库包文件本身（不搞 multipart，零依赖）
   if (p === '/library/import' && req.method === 'POST') {
-    const buf = await readRawBody(req, 512 * 1024 * 1024);
-    if (!buf.length) return json(res, 400, { ok: false, error: '没有收到文件' });
     const tmp = path.join(os.tmpdir(), `danmu-import-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.db`);
-    fs.writeFileSync(tmp, buf);
+    let size = 0;
     try {
-      const out = library.importLibrary(store, tmp, {
+      size = await receiveFile(req, tmp, 512 * 1024 * 1024);
+    } catch (err) {
+      return json(res, err.message === '文件太大' ? 413 : 400, { ok: false, error: err.message });
+    }
+    if (!size) {
+      fs.rm(tmp, { force: true }, () => {});
+      return json(res, 400, { ok: false, error: '没有收到文件' });
+    }
+    try {
+      const out = await library.importLibrary(store, tmp, {
         onProgress: (x) => broadcast('libprogress', x),
+        // 导入响应先返回；弹幕潮在后台从导入起始时间重算，避免请求线程一直等全表扫。
+        deferFloods: true,
       });
+      store.invalidateStats();
       broadcast('rooms', roomListFull());
       broadcast('stats', store.stats());
-      return json(res, 200, { ok: true, ...out });
+      json(res, 200, { ok: true, ...out });
+      if (out.floodPending) {
+        setTimeout(() => {
+          try {
+            broadcast('libprogress', { phase: 'recompute', step: 'floods' });
+            const f = store.rebuildFloods({ since: out.from || 0 });
+            store.invalidateStats();
+            broadcast('stats', store.stats());
+            broadcast('libprogress', {
+              phase: 'done',
+              inserted: out.inserted,
+              dupes: out.dupes,
+              rooms: out.rooms,
+              topics: out.topics,
+              floods: f.events,
+              floodPending: false,
+            });
+          } catch (err) {
+            console.warn(`[库包] 后台重算弹幕潮失败：${err.message}`);
+            broadcast('libprogress', { phase: 'error', message: err.message });
+          }
+        }, 100).unref?.();
+      }
+      return;
     } finally {
       fs.rm(tmp, { force: true }, () => {});
     }
@@ -1158,17 +1243,13 @@ const server = http.createServer(async (req, res) => {
       connection: 'keep-alive',
       'x-accel-buffering': 'no',
     });
-    res.write(': connected\n\n');
     clients.add(res);
+    sseWrite(res, ': connected\n\n');
     uiAttached = true;
     graceSince = 0;
     sseSend(res, 'hello', { rooms: roomListFull(), stats: store.stats() });
     const ping = setInterval(() => {
-      try {
-        res.write(': ping\n\n');
-      } catch {
-        /* ignore */
-      }
+      sseWrite(res, ': ping\n\n');
     }, 25000);
     // 用 res 的 close：req 的 close 在 keep-alive 连接上不一定触发，会让 clients 永远留着一条
     res.on('close', () => {
@@ -1855,6 +1936,16 @@ server.listen(PORT, HOST, async () => {
   store.warmUserIndex().then((rows) => {
     if (rows.length) console.log(`  ▶ 用户索引 ${rows.length} 人`);
   }).catch(() => {});
+
+  // 上次改前后缀中途退出：stem 可能只重算了一半，启动后后台补完。
+  if (store.metaGet('affixes_dirty') === '1') {
+    setTimeout(() => {
+      store
+        .applyAffixes(store.getAffixes(), { onProgress: (x) => broadcast('affixprogress', x) })
+        .then((r) => console.log(`[维护] 启动补算前后缀 ${r.changed}/${r.total} 条`))
+        .catch((err) => console.warn(`[维护] 启动补算前后缀失败：${err.message}`));
+    }, 3000).unref?.();
+  }
 
   // 自愈：库里有大量弹幕却没有任何潮记录（外部合并/换库后常见），后台重建一次。
   // 不重建的话，检索面板会显示「弹幕潮 0 次」，看着像功能坏了。

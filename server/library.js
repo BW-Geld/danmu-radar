@@ -190,7 +190,7 @@ function exportLibrary(store, opts = {}) {
  * @param {string} file 已落盘的 .db
  * @param {{onProgress?:(p:object)=>void}} opts
  */
-function importLibrary(store, file, opts = {}) {
+async function importLibrary(store, file, opts = {}) {
   const say = (p) => opts.onProgress && opts.onProgress(p);
 
   const pkg = new DatabaseSync(file);
@@ -211,6 +211,7 @@ function importLibrary(store, file, opts = {}) {
   }
 
   const total = Number(meta.rows) || pkg.prepare('SELECT COUNT(*) AS c FROM messages').get().c;
+  const maxId = Number(pkg.prepare('SELECT MAX(id) AS m FROM messages').get().m) || 0;
   say({ phase: 'read', total });
 
   pkg.close();
@@ -218,15 +219,34 @@ function importLibrary(store, file, opts = {}) {
   db.exec(`ATTACH DATABASE '${file.replace(/'/g, "''")}' AS pkg`);
 
   try {
-    const before = db.prepare('SELECT COUNT(*) AS c FROM messages').get().c;
-    db.exec('BEGIN IMMEDIATE');
-    db.exec(`
+    // 按库包里的 id 分批，一批 5000 行；每批单独事务并让出事件循环。
+    // 这样 512MB 的内存峰值和「一条超长事务锁住采集」都消失了。
+    const BATCH = 5000;
+    const batchIds = db.prepare('SELECT id FROM pkg.messages WHERE id > ? ORDER BY id LIMIT ?');
+    const merge = db.prepare(`
       INSERT OR IGNORE INTO messages(${MSG_COLS.join(',')})
       SELECT ${MSG_COLS.join(',')} FROM pkg.messages
+       WHERE id > ? AND id <= ?
     `);
-    db.exec('COMMIT');
-    const after = db.prepare('SELECT COUNT(*) AS c FROM messages').get().c;
-    const inserted = after - before;
+    let lastId = 0;
+    let inserted = 0;
+    while (lastId < maxId) {
+      const ids = batchIds.all(lastId, BATCH);
+      if (!ids.length) break;
+      const maxBatchId = ids[ids.length - 1].id;
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const r = merge.run(lastId, maxBatchId);
+        inserted += Number(r.changes) || 0;
+        db.exec('COMMIT');
+      } catch (err) {
+        db.exec('ROLLBACK');
+        throw err;
+      }
+      lastId = maxBatchId;
+      say({ phase: 'merge', inserted, done: lastId, total });
+      await new Promise((resolve) => setImmediate(resolve));
+    }
 
     // 房间：有就更新名字，没有就补一条（不自动开始采集）
     const rooms = db.prepare('SELECT COUNT(*) AS c FROM pkg.rooms').get().c;
@@ -235,7 +255,8 @@ function importLibrary(store, file, opts = {}) {
       SELECT rid, name, owner, avatar, cate, 'saved', added_at, last_msg_at, 0 FROM pkg.rooms
       WHERE rid NOT IN (SELECT rid FROM main.rooms)
     `);
-    say({ phase: 'merged', inserted, dupes: total - inserted, rooms, total });
+    const dupes = Math.max(0, total - inserted);
+    say({ phase: 'merged', inserted, dupes, rooms, total });
 
     // 重算：词条分类 + 弹幕潮（导入的行 topic/stem 可能来自旧版本口径）
     say({ phase: 'recompute', step: 'topics' });
@@ -245,11 +266,30 @@ function importLibrary(store, file, opts = {}) {
       n += done;
       if (done < 4000) break;
       say({ phase: 'recompute', step: 'topics', done: n });
+      await new Promise((resolve) => setImmediate(resolve));
     }
-    say({ phase: 'recompute', step: 'floods' });
-    const f = store.rebuildFloods({ since: 0 });
-    say({ phase: 'done', inserted, dupes: total - inserted, rooms, topics: n, floods: f.events });
-    return { ok: true, inserted, dupes: total - inserted, rooms, topics: n, floods: f.events, meta };
+
+    const from = Number(meta.from) || 0;
+    let floods = null;
+    if (opts.deferFloods) {
+      say({ phase: 'recompute', step: 'floods', deferred: true });
+    } else {
+      say({ phase: 'recompute', step: 'floods' });
+      const f = store.rebuildFloods({ since: from });
+      floods = f.events;
+    }
+    say({ phase: 'done', inserted, dupes, rooms, topics: n, floods, floodPending: !!opts.deferFloods });
+    return {
+      ok: true,
+      inserted,
+      dupes,
+      rooms,
+      topics: n,
+      floods,
+      floodPending: !!opts.deferFloods,
+      from,
+      meta,
+    };
   } finally {
     try {
       db.exec('DETACH DATABASE pkg');

@@ -66,49 +66,67 @@ ok('回覆前缀与口癖可以叠加', () => {
 
 // --- 落库与重算 -----------------------------------------------------------
 
-const tmp = path.join(os.tmpdir(), `danmu-affix-${Date.now()}.db`);
-const store = new Store(tmp);
-store.open();
-setAffixes({ prefixes: [], suffixes: [] }); // 模拟"用户还没配置"的初始状态
+(async () => {
+  const tmp = path.join(os.tmpdir(), `danmu-affix-${Date.now()}.db`);
+  const store = new Store(tmp);
+  store.open();
+  setAffixes({ prefixes: [], suffixes: [] }); // 模拟"用户还没配置"的初始状态
 
-const rows = [
-  { rid: 1, uid: 10, txt: '绝不认输', cst: 1800000000000, kind: 'chat', nn: 'a', source: 'live' },
-  { rid: 1, uid: 11, txt: '绝不认输desuwa', cst: 1800000001000, kind: 'chat', nn: 'b', source: 'live' },
-  { rid: 1, uid: 12, txt: '@a: 绝不认输desuwa', cst: 1800000002000, kind: 'chat', nn: 'c', source: 'live' },
-];
-store.insertBatch(rows);
+  const rows = [
+    { rid: 1, uid: 10, txt: '绝不认输', cst: 1800000000000, kind: 'chat', nn: 'a', source: 'live' },
+    { rid: 1, uid: 11, txt: '绝不认输desuwa', cst: 1800000001000, kind: 'chat', nn: 'b', source: 'live' },
+    { rid: 1, uid: 12, txt: '@a: 绝不认输desuwa', cst: 1800000002000, kind: 'chat', nn: 'c', source: 'live' },
+  ];
+  store.insertBatch(rows);
 
-ok('未配置时「绝不认输」与「…desuwa」是两个说法', () => {
-  const g = store.groupByTerms(['绝不认输']);
-  assert.ok(g.length >= 2, `应当至少两组，实际 ${g.length}`);
+  ok('未配置时「绝不认输」与「…desuwa」是两个说法', () => {
+    const g = store.groupByTerms(['绝不认输']);
+    assert.ok(g.length >= 2, `应当至少两组，实际 ${g.length}`);
+  });
+
+  const progress = [];
+  const res = await store.applyAffixes(
+    { prefixes: [], suffixes: ['desuwa'] },
+    { onProgress: (p) => progress.push(p) }
+  );
+
+  ok('applyAffixes 会重算历史并返回改动数', () => {
+    assert.ok(res.changed >= 1, `changed=${res.changed}`);
+    assert.deepEqual(res.suffixes, ['desuwa']);
+  });
+
+  ok('分批重算会回报进度', () => {
+    assert.ok(progress.length >= 1, `progress=${progress.length}`);
+    assert.equal(progress[progress.length - 1].done, 3);
+  });
+
+  ok('重算完成后清掉 dirty 标记', () => {
+    assert.equal(store.metaGet('affixes_dirty'), '0');
+  });
+
+  ok('重算后三句话并成一组', () => {
+    const g = store.groupByTerms(['绝不认输']);
+    assert.equal(g.length, 1, `应当 1 组，实际 ${g.length}`);
+    assert.equal(g[0].n, 3);
+    assert.equal(g[0].users, 3);
+    assert.equal(g[0].disp, '绝不认输');
+  });
+
+  ok('配置写进了 meta，重启后仍生效', () => {
+    assert.deepEqual(store.getAffixes().suffixes, ['desuwa']);
+    const again = new Store(tmp);
+    again.open();
+    assert.deepEqual(again.getAffixes().suffixes, ['desuwa']);
+    const g = again.groupByTerms(['绝不认输']);
+    assert.equal(g.length, 1);
+    again.close();
+  });
+
+  store.close();
+
+  console.log(`\n${passed} 项通过${failed ? ` / ${failed} 项失败` : ''}`);
+  process.exit(failed ? 1 : 0);
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
 });
-
-const res = store.applyAffixes({ prefixes: [], suffixes: ['desuwa'] });
-
-ok('applyAffixes 会重算历史并返回改动数', () => {
-  assert.ok(res.changed >= 1, `changed=${res.changed}`);
-  assert.deepEqual(res.suffixes, ['desuwa']);
-});
-
-ok('重算后三句话并成一组', () => {
-  const g = store.groupByTerms(['绝不认输']);
-  assert.equal(g.length, 1, `应当 1 组，实际 ${g.length}`);
-  assert.equal(g[0].n, 3);
-  assert.equal(g[0].users, 3);
-  assert.equal(g[0].disp, '绝不认输');
-});
-
-ok('配置写进了 meta，重启后仍生效', () => {
-  assert.deepEqual(store.getAffixes().suffixes, ['desuwa']);
-  const again = new Store(tmp);
-  again.open();
-  assert.deepEqual(again.getAffixes().suffixes, ['desuwa']);
-  const g = again.groupByTerms(['绝不认输']);
-  assert.equal(g.length, 1);
-  again.close();
-});
-
-store.close();
-
-console.log(`\n${passed} 项通过${failed ? ` / ${failed} 项失败` : ''}`);
-process.exit(failed ? 1 : 0);

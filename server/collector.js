@@ -24,6 +24,7 @@ class Collector extends EventEmitter {
     this.clients = new Map(); // rid -> { client, info, state }
     this.buffer = [];
     this.dropped = 0; // 被唯一索引挡掉的重复（补发且时间戳未变）
+    this.overflowDropped = 0; // 落库失败且缓冲已满时，被迫丢掉的最老条数
     this.replayDropped = 0; // 重连窗口内按内容挡掉的重复（补发且时间戳被重打）
     this.lateFrames = 0; // 收到比水位更早的帧，说明服务端在回放旧消息
     this.recent = new Map(); // uid|txt -> cst，用于重连窗口内的内容去重
@@ -271,8 +272,16 @@ class Collector extends EventEmitter {
         return;
       }
       this.log(`落库失败：${err.message}`);
-      // 写失败时把数据放回缓冲（限制上限，避免内存爆掉）
-      this.buffer = rows.concat(this.buffer).slice(-2000);
+      // 写失败时把数据放回缓冲（限制上限，避免内存爆掉）；超出的最老数据只能丢，
+      // 但要计数并广播，不能像以前那样悄悄截断。
+      const merged = rows.concat(this.buffer);
+      const overflow = Math.max(0, merged.length - 2000);
+      if (overflow > 0) {
+        this.overflowDropped += overflow;
+        this.log(`缓冲已满，丢弃最老 ${overflow} 条（累计 ${this.overflowDropped} 条）`);
+        this.emit('overflow', { dropped: overflow, total: this.overflowDropped });
+      }
+      this.buffer = merged.slice(-2000);
     }
   }
 

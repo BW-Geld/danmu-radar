@@ -187,6 +187,15 @@ es.addEventListener('favorites', () => {
 es.addEventListener('prefs', () => {
   loadPrefs().catch(() => {});
 });
+es.addEventListener('overflow', (e) => {
+  let d = {};
+  try {
+    d = JSON.parse(e.data);
+  } catch {
+    /* ignore */
+  }
+  toast(`落库暂时失败，已丢弃最老的 ${fmtNum(d.dropped || 0)} 条缓冲（累计 ${fmtNum(d.total || 0)} 条）`, true, 10000);
+});
 
 // 库文件被外部删掉：采集已停，界面必须说清楚，否则会以为还在正常采
 es.addEventListener('dbgone', (e) => {
@@ -2441,9 +2450,15 @@ function onLibProgress(d) {
   if (d.phase === 'read') el.textContent = `读取库包…共 ${fmtNum(d.total)} 条`;
   else if (d.phase === 'merged') el.textContent = `已合并 新增 ${fmtNum(d.inserted)} / 重复 ${fmtNum(d.dupes)}，正在重算…`;
   else if (d.phase === 'recompute') {
-    el.textContent =
-      d.step === 'topics' ? `正在重算词条分类${d.done ? `（已处理 ${fmtNum(d.done)} 条）` : ''}…` : '正在重算弹幕潮…';
-  } else if (d.phase === 'done') el.textContent = `完成：新增 ${fmtNum(d.inserted)} 条，重复 ${fmtNum(d.dupes)} 条`;
+    if (d.step === 'floods' && d.deferred) el.textContent = '已合并，正在后台重算弹幕潮…';
+    else
+      el.textContent =
+        d.step === 'topics' ? `正在重算词条分类${d.done ? `（已处理 ${fmtNum(d.done)} 条）` : ''}…` : '正在重算弹幕潮…';
+  } else if (d.phase === 'done') {
+    el.textContent = d.floodPending
+      ? `已合并：新增 ${fmtNum(d.inserted)} 条，重复 ${fmtNum(d.dupes)} 条；正在后台重算弹幕潮…`
+      : `完成：新增 ${fmtNum(d.inserted)} 条，重复 ${fmtNum(d.dupes)} 条`;
+  } else if (d.phase === 'error') el.textContent = `导入失败：${d.message || '未知错误'}`;
 }
 
 // ------------------------------------------------------------ 界面与退出

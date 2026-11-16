@@ -382,6 +382,21 @@ class Store {
     this._userIndex = null;
     this._userIndexAt = 0;
     this._userIndexPromise = null;
+    // /api/stats 的全表统计一次约 0.5 秒；SSE 首包和前端 15 秒刷新都会调，缓存 30 秒。
+    this._statsCache = null;
+    this._statsAt = 0;
+    // 房间汇总也是全表 GROUP BY rid；/api/stats 和 /api/rooms 都会调，和 stats 一起缓存。
+    this._roomSummaryCache = null;
+    this._roomSummaryAt = 0;
+    this._affixBusy = false;
+  }
+
+  /** 导入/清理后让下一次 stats() 重新统计，避免缓存显示旧数字。 */
+  invalidateStats() {
+    this._statsCache = null;
+    this._statsAt = 0;
+    this._roomSummaryCache = null;
+    this._roomSummaryAt = 0;
   }
 
   /** 兼容外部显式初始化调用 */
@@ -991,8 +1006,12 @@ class Store {
   }
 
   /** 消息里出现过、但 rooms 表里没有的房间（房间记录被删/丢失时，历史不该跟着消失）。 */
-  messageRoomSummary() {
-    return this.db
+  messageRoomSummary({ fresh = false } = {}) {
+    const now = Date.now();
+    if (!fresh && this._roomSummaryCache && now - this._roomSummaryAt < 30000) {
+      return this._roomSummaryCache.map((r) => ({ ...r }));
+    }
+    this._roomSummaryCache = this.db
       .prepare(
         `SELECT rid, MAX(room_name) AS name, COUNT(*) AS n, MAX(cst) AS last,
                 SUM(CASE WHEN source = 'vod' THEN 1 ELSE 0 END) AS vod
@@ -1006,6 +1025,8 @@ class Store {
         last: Number(r.last) || 0,
         vodOnly: Number(r.n) > 0 && Number(r.vod) === Number(r.n),
       }));
+    this._roomSummaryAt = now;
+    return this._roomSummaryCache.map((r) => ({ ...r }));
   }
 
   touchRooms(rows) {
@@ -1945,7 +1966,11 @@ class Store {
       .all(raw, `%${raw}%`, lim);
   }
 
-  stats() {
+  stats({ fresh = false } = {}) {
+    const now = Date.now();
+    if (!fresh && this._statsCache && now - this._statsAt < 30000) {
+      return { ...this._statsCache };
+    }
     const m = this.db
       .prepare('SELECT COUNT(*) AS total, COUNT(DISTINCT uid) AS users, MIN(cst) AS first, MAX(cst) AS last FROM messages')
       .get();
@@ -1960,7 +1985,9 @@ class Store {
     // WAL 里可能还有没 checkpoint 的页，按 -wal 文件补上，避免界面显示偏小
     const wal = `${file}-wal`;
     const walSize = fs.existsSync(wal) ? fs.statSync(wal).size : 0;
-    return { ...m, today: today.n, dbBytes: size + walSize };
+    this._statsCache = { ...m, today: today.n, dbBytes: size + walSize };
+    this._statsAt = now;
+    return { ...this._statsCache };
   }
 
   metaGet(k, def = null) {
@@ -1979,45 +2006,88 @@ class Store {
    * 重算是必须的——不重算的话，只有新弹幕会用新规则，同一句话在新老数据里
    * 停在两个不同的 stem 上，列表看着还是「重复」。
    */
-  applyAffixes(cfg) {
-    const clean = {
-      prefixes: [...new Set((cfg.prefixes || []).map((s) => String(s).trim()).filter(Boolean))],
-      suffixes: [...new Set((cfg.suffixes || []).map((s) => String(s).trim()).filter(Boolean))],
-    };
-    setAffixes(clean);
-    this.metaSet('affixes', JSON.stringify(clean));
-
-    const rows = this.db.prepare("SELECT id, txt, stem FROM messages WHERE kind = 'chat'").all();
-    const upd = this.db.prepare('UPDATE messages SET stem = ? WHERE id = ?');
-    let changed = 0;
-    this.db.exec('BEGIN');
-    try {
-      for (const r of rows) {
-        const s = stemOf(r.txt);
-        if (s !== r.stem) {
-          upd.run(s, r.id);
-          changed++;
-        }
-      }
-      this.db.exec('COMMIT');
-    } catch (err) {
-      this.db.exec('ROLLBACK');
+  async applyAffixes(cfg, { onProgress } = {}) {
+    if (this._affixBusy) {
+      const err = new Error('前后缀正在重算，请稍后再试');
+      err.code = 'AFFIX_BUSY';
       throw err;
     }
-    return { changed, total: rows.length, ...getAffixes() };
+    this._affixBusy = true;
+    try {
+      const clean = {
+        prefixes: [...new Set((cfg.prefixes || []).map((s) => String(s).trim()).filter(Boolean))],
+        suffixes: [...new Set((cfg.suffixes || []).map((s) => String(s).trim()).filter(Boolean))],
+      };
+      // 先标记 dirty：中途退出/崩溃时，下次启动知道历史 stem 可能只重算了一半。
+      // 必须在改全局配置之前写，否则崩溃会留下「新配置 + 旧 stem」且没有 dirty 的状态。
+      this.metaSet('affixes_dirty', '1');
+      setAffixes(clean);
+      this.metaSet('affixes', JSON.stringify(clean));
+      const total = Number(
+        this.db.prepare("SELECT COUNT(*) AS n FROM messages WHERE kind = 'chat'").get().n
+      ) || 0;
+      const sel = this.db.prepare(
+        "SELECT id, txt, stem FROM messages WHERE kind = 'chat' AND id > ? ORDER BY id LIMIT ?"
+      );
+      const upd = this.db.prepare('UPDATE messages SET stem = ? WHERE id = ?');
+      const BATCH = 2000;
+      let changed = 0;
+      let done = 0;
+      let lastId = 0;
+      for (;;) {
+        const rows = sel.all(lastId, BATCH);
+        if (!rows.length) break;
+        this.db.exec('BEGIN IMMEDIATE');
+        try {
+          for (const r of rows) {
+            const s = stemOf(r.txt);
+            if (s !== r.stem) {
+              upd.run(s, r.id);
+              changed++;
+            }
+          }
+          this.db.exec('COMMIT');
+        } catch (err) {
+          this.db.exec('ROLLBACK');
+          throw err;
+        }
+        lastId = rows[rows.length - 1].id;
+        done += rows.length;
+        if (typeof onProgress === 'function') onProgress({ done, total, changed });
+        // 让出事件循环：采集、SSE、其他页面请求都能插进来，而不是整库冻结。
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      this.metaSet('affixes_dirty', '0');
+      return { changed, total, ...getAffixes() };
+    } finally {
+      this._affixBusy = false;
+    }
   }
 
   getAffixes() {
     return getAffixes();
   }
 
-  /** 保留策略：删除早于 N 天的弹幕 */  prune(days) {
+  /** 保留策略：删除早于 N 天的弹幕；分批删，避免一条长事务把采集卡死。 */
+  async prune(days) {
     const cutoff = Date.now() - days * 86400000;
-    const r = this.db.prepare('DELETE FROM messages WHERE cst < ?').run(cutoff);
+    const del = this.db.prepare(
+      'DELETE FROM messages WHERE id IN (SELECT id FROM messages WHERE cst < ? LIMIT 5000)'
+    );
+    let removed = 0;
+    for (;;) {
+      const r = del.run(cutoff);
+      const n = Number(r.changes) || 0;
+      if (!n) break;
+      removed += n;
+      await new Promise((resolve) => setImmediate(resolve));
+    }
     // 看点跟着弹幕一起过期，否则清完弹幕还留着一堆跳不过去的看点
     this.db.prepare('DELETE FROM highlights WHERE start_ms < ?').run(cutoff);
-    this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
-    return Number(r.changes) || 0;
+    // PASSIVE 不阻塞读；TRUNCATE 要求没有读者，挂机时很难满足，容易直接报 busy。
+    this.db.exec('PRAGMA wal_checkpoint(PASSIVE)');
+    this.invalidateStats();
+    return removed;
   }
 
   // ---------------------------------------------------------------- 词条归类

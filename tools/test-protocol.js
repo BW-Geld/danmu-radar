@@ -69,11 +69,11 @@ check('同一行的重复投递被忽略', () => {
 });
 check('同一个人同一毫秒发同样的话只算一条', () => {
   store.insertBatch([{ ...row, cst: row.cst + 1 }]);
-  assert.strictEqual(store.stats().total, 2);
+  assert.strictEqual(store.stats({ fresh: true }).total, 2);
 });
 check('不同房间相同内容不互相吞掉', () => {
   store.insertBatch([{ ...row, rid: 2 }]);
-  assert.strictEqual(store.stats().total, 3);
+  assert.strictEqual(store.stats({ fresh: true }).total, 3);
 });
 check('批量里夹带重复只写一次', () => {
   const r = store.insertBatch([{ ...row, cst: 999 }, { ...row, cst: 999 }, { ...row, cst: 999 }]);
@@ -85,7 +85,7 @@ check('批量里夹带重复只写一次', () => {
 check('重复打开同一个库不会重复迁移', () => {
   store.close();
   const again = new Store(tmp);
-  assert.strictEqual(again.stats().total, 4);
+  assert.strictEqual(again.stats({ fresh: true }).total, 4);
   again.close();
 });
 

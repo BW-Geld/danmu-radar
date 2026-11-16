@@ -86,23 +86,23 @@ function seed(store) {
   // 2. 导进空库
   const dstStore = new Store(dstPath);
   dstStore.open();
-  const r1 = importLibrary(dstStore, anonPack.file);
+  const r1 = await importLibrary(dstStore, anonPack.file);
   ok(r1.inserted === 201 && r1.dupes === 0, '空库导入：全部新增', `新增 ${r1.inserted} / 重复 ${r1.dupes}`);
 
   // 3. 再导一遍
-  const r2 = importLibrary(dstStore, anonPack.file);
+  const r2 = await importLibrary(dstStore, anonPack.file);
   ok(r2.inserted === 0 && r2.dupes === 201, '重复导入：全部算重复', `新增 ${r2.inserted} / 重复 ${r2.dupes}`);
 
   // 4. 实名包导进已有匿名包的库：同一条弹幕不能翻倍
   const fullPack = exportLibrary(srcStore, { anon: false });
-  const r3 = importLibrary(dstStore, fullPack.file);
+  const r3 = await importLibrary(dstStore, fullPack.file);
   ok(r3.inserted === 0 && r3.dupes === 201, '实名包 × 匿名包：指纹一致，一条都不重复入库', `新增 ${r3.inserted} / 重复 ${r3.dupes}`);
 
   // 5. 反向：先实名后匿名
   const dst2 = new Store(path.join(dir, 'dst2.db'));
   dst2.open();
-  const r4 = importLibrary(dst2, fullPack.file);
-  const r5 = importLibrary(dst2, anonPack.file);
+  const r4 = await importLibrary(dst2, fullPack.file);
+  const r5 = await importLibrary(dst2, anonPack.file);
   ok(r4.inserted === 201 && r5.inserted === 0, '先实名后匿名：也不翻倍', `实名 ${r4.inserted} / 匿名 ${r5.inserted}`);
 
   // 6. 按房间 / 按时间切片
@@ -121,7 +121,7 @@ function seed(store) {
   fs.writeFileSync(badFile, 'not a database');
   let threw = false;
   try {
-    importLibrary(dstStore, badFile);
+    await importLibrary(dstStore, badFile);
   } catch {
     threw = true;
   }
