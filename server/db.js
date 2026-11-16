@@ -1131,8 +1131,8 @@ class Store {
     if (!terms.length) return [];
     const where = [];
     const args = [];
-    const clauses = terms.map(() => 'ntxt LIKE ?');
-    for (const t of terms) args.push(`%${t}%`);
+    const clauses = terms.map(() => 'instr(ntxt, ?) > 0');
+    for (const t of terms) args.push(String(t));
     where.push(`(${clauses.join(' OR ')})`);
     if (rid) {
       where.push('rid = ?');
@@ -1162,8 +1162,8 @@ class Store {
     if (!terms.length) return [];
     const where = [];
     const args = [];
-    where.push(`(${terms.map(() => 'ntxt LIKE ?').join(' OR ')})`);
-    for (const t of terms) args.push(`%${t}%`);
+    where.push(`(${terms.map(() => 'instr(ntxt, ?) > 0').join(' OR ')})`);
+    for (const t of terms) args.push(String(t));
     where.push("kind = 'chat'");
     if (rid) {
       where.push('rid = ?');
@@ -1192,15 +1192,17 @@ class Store {
     const keys = groups.map((g) => g.g);
     const samples = new Map();
     if (keys.length) {
+      const marks = keys.map(() => '?').join(',');
       const rows = this.db
         .prepare(
           `SELECT COALESCE(NULLIF(stem, ''), txt) AS g, id, rid, room_name, uid, nn, txt, cst, level, bnn, bl, source
            FROM messages
-           WHERE COALESCE(NULLIF(stem, ''), txt) IN (${keys.map(() => '?').join(',')}) AND kind = 'chat'
+           WHERE (stem IN (${marks}) OR ((stem IS NULL OR stem = '') AND txt IN (${marks})))
+             AND kind = 'chat'
            ORDER BY cst DESC
            LIMIT ?`
         )
-        .all(...keys, Math.min(keys.length * 30, 4000));
+        .all(...keys, ...keys, Math.min(keys.length * 30, 4000));
       for (const r of rows) {
         const cur = samples.get(r.g);
         if (!cur) samples.set(r.g, r);
@@ -1222,10 +1224,12 @@ class Store {
                         ORDER BY LENGTH(txt) DESC, cst DESC
                       ) AS rn
                FROM messages
-               WHERE kind = 'chat' AND COALESCE(NULLIF(stem, ''), txt) IN (${missing.map(() => '?').join(',')})
+               WHERE kind = 'chat'
+                 AND (stem IN (${missing.map(() => '?').join(',')})
+                   OR ((stem IS NULL OR stem = '') AND txt IN (${missing.map(() => '?').join(',')})))
              ) WHERE rn = 1`
           )
-          .all(...missing);
+          .all(...missing, ...missing);
         for (const r of again) {
           if (!samples.has(r.g)) samples.set(r.g, r);
         }
@@ -1562,23 +1566,23 @@ class Store {
   countSearchTerms({ exact, synonyms = [], cooccur = [], rid, from, to } = {}) {
     if (!exact) return { exact: 0, synonym: 0, cooccur: 0 };
     const args = [];
-    const likeAny = (terms) => {
+    const hitAny = (terms) => {
       if (!terms.length) return '0';
       return (
         '(' +
         terms
           .map((t) => {
-            args.push(`%${t}%`);
-            return 'ntxt LIKE ?';
+            args.push(String(t));
+            return 'instr(ntxt, ?) > 0';
           })
           .join(' OR ') +
         ')'
       );
     };
-    // 每个词只 LIKE 一次，放进 CTE 算标志位，再在外面 SUM；不要重复 LIKE。
-    const exactA = likeAny([exact]);
-    const synA = likeAny(synonyms);
-    const coocA = likeAny(cooccur);
+    // 每个词只查一次，放进 CTE 算标志位，再在外面 SUM；不要重复扫。
+    const exactA = hitAny([exact]);
+    const synA = hitAny(synonyms);
+    const coocA = hitAny(cooccur);
     const where = [];
     if (rid) {
       where.push('rid = ?');
