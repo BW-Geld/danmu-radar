@@ -378,6 +378,10 @@ class Store {
     this.path = dbPath;
     this.db = open(dbPath);
     this._cache = new Map();
+    // 用户聚合缓存：/api/users 的 GROUP BY uid 全表扫一次约 3 秒，缓存后按昵称筛选在内存里做。
+    this._userIndex = null;
+    this._userIndexAt = 0;
+    this._userIndexPromise = null;
   }
 
   /** 兼容外部显式初始化调用 */
@@ -904,27 +908,41 @@ class Store {
       .run(String(showId), Number(rid), Number(to), Number(from));
   }
 
-  /** 有效采集时间 = 跨度 − 缺口，画像的分母要用这个。 */
-  coverage({ rid = 0, from = 0, to = 0 } = {}) {
-    const where = ['kind = \'chat\''];
-    const args = [];
-    if (rid) {
-      where.push('rid = ?');
-      args.push(Number(rid));
+  /**
+   * 有效采集时间 = 跨度 − 缺口，画像的分母要用这个。
+   * known 可传 { first, last, total }：画像开头已经用 userTotals 扫过一遍，
+   * 再为了 MIN/MAX/COUNT 重扫全表纯属浪费（实测占画像 170ms）。
+   */
+  coverage({ rid = 0, from = 0, to = 0, known = null } = {}) {
+    let first = 0;
+    let last = 0;
+    let messages = 0;
+    if (known) {
+      first = Number(known.first) || 0;
+      last = Number(known.last) || 0;
+      messages = Number(known.total) || 0;
+    } else {
+      const where = ['kind = \'chat\''];
+      const args = [];
+      if (rid) {
+        where.push('rid = ?');
+        args.push(Number(rid));
+      }
+      if (from) {
+        where.push('cst >= ?');
+        args.push(Number(from));
+      }
+      if (to) {
+        where.push('cst <= ?');
+        args.push(Number(to));
+      }
+      const row = this.db
+        .prepare(`SELECT MIN(cst) AS a, MAX(cst) AS b, COUNT(*) AS n FROM messages WHERE ${where.join(' AND ')}`)
+        .get(...args);
+      first = Number(row.a) || 0;
+      last = Number(row.b) || 0;
+      messages = Number(row.n) || 0;
     }
-    if (from) {
-      where.push('cst >= ?');
-      args.push(Number(from));
-    }
-    if (to) {
-      where.push('cst <= ?');
-      args.push(Number(to));
-    }
-    const row = this.db
-      .prepare(`SELECT MIN(cst) AS a, MAX(cst) AS b, COUNT(*) AS n FROM messages WHERE ${where.join(' AND ')}`)
-      .get(...args);
-    const first = Number(row.a) || 0;
-    const last = Number(row.b) || 0;
     const spanMs = last > first ? last - first : 0;
     const gap = this.gapTotal({ rid, from, to });
     const effectiveMs = Math.max(0, spanMs - gap.ms);
@@ -936,7 +954,7 @@ class Store {
       gapCount: gap.count,
       gapMs: gap.ms,
       effectiveMs,
-      messages: Number(row.n) || 0,
+      messages,
       downtimeCount: split.downtime.count,
       downtimeMs: split.downtime.ms,
     };
@@ -1536,6 +1554,75 @@ class Store {
     return Number(row.n) || 0;
   }
 
+  /**
+   * 检索三路计数一次扫完：精确 / 同义（排除精确）/ 强相关（排除前两者）。
+   * 原来调用 countByTerms 三次，每次都是一遍 ntxt LIKE 全表扫（实测 386ms）；
+   * 合并成一条 CASE SUM 后只扫一遍。
+   */
+  countSearchTerms({ exact, synonyms = [], cooccur = [], rid, from, to } = {}) {
+    if (!exact) return { exact: 0, synonym: 0, cooccur: 0 };
+    const args = [];
+    const likeAny = (terms) => {
+      if (!terms.length) return '0';
+      return (
+        '(' +
+        terms
+          .map((t) => {
+            args.push(`%${t}%`);
+            return 'ntxt LIKE ?';
+          })
+          .join(' OR ') +
+        ')'
+      );
+    };
+    // 每个词只 LIKE 一次，放进 CTE 算标志位，再在外面 SUM；不要重复 LIKE。
+    const exactA = likeAny([exact]);
+    const synA = likeAny(synonyms);
+    const coocA = likeAny(cooccur);
+    const where = [];
+    if (rid) {
+      where.push('rid = ?');
+      args.push(Number(rid));
+    }
+    if (from) {
+      where.push('cst >= ?');
+      args.push(Number(from));
+    }
+    if (to) {
+      where.push('cst <= ?');
+      args.push(Number(to));
+    }
+    const whereSql = where.length ? 'WHERE ' + where.join(' AND ') : '';
+    // 只有精确词时不必算另外两路标志位；单独 COUNT 比 CTE 快一倍。
+    if (!synonyms.length && !cooccur.length) {
+      const row = this.db
+        .prepare(`SELECT COUNT(*) AS exact_n FROM messages WHERE ${[exactA, ...where].join(' AND ')}`)
+        .get(...args);
+      return { exact: Number(row.exact_n) || 0, synonym: 0, cooccur: 0 };
+    }
+    const row = this.db
+      .prepare(
+        `WITH f AS (
+           SELECT
+             CASE WHEN ${exactA} THEN 1 ELSE 0 END AS e,
+             CASE WHEN ${synA} THEN 1 ELSE 0 END AS s,
+             CASE WHEN ${coocA} THEN 1 ELSE 0 END AS c
+           FROM messages ${whereSql}
+         )
+         SELECT
+           SUM(e) AS exact_n,
+           SUM(CASE WHEN s = 1 AND e = 0 THEN 1 ELSE 0 END) AS syn_n,
+           SUM(CASE WHEN c = 1 AND e = 0 AND s = 0 THEN 1 ELSE 0 END) AS cooc_n
+         FROM f`
+      )
+      .get(...args);
+    return {
+      exact: Number(row.exact_n) || 0,
+      synonym: Number(row.syn_n) || 0,
+      cooccur: Number(row.cooc_n) || 0,
+    };
+  }
+
   /** 某段时间窗口内的弹幕（共现分析用） */
   windowMessages(rid, from, to, limit = 3000) {
     return this.db
@@ -1761,16 +1848,88 @@ class Store {
     return row ? Number(row.n) : 0;
   }
 
+  /** 建一次用户聚合索引；findUsers 之后在内存里筛选，不再每次扫 30 万条。 */
+  _buildUserIndex() {
+    const rows = this.db
+      .prepare(
+        `SELECT uid, nn, COUNT(*) AS n, MAX(cst) AS last, COUNT(DISTINCT rid) AS rooms
+         FROM messages WHERE uid != '' GROUP BY uid ORDER BY n DESC`
+      )
+      .all();
+    return rows.map((r) => ({
+      uid: String(r.uid),
+      nn: r.nn == null ? '' : String(r.nn),
+      n: Number(r.n) || 0,
+      last: Number(r.last) || 0,
+      rooms: Number(r.rooms) || 0,
+    }));
+  }
+
+  /**
+   * 预热/刷新用户索引。索引本身要全表聚合一次（约 3 秒），所以放在启动后做；
+   * 5 分钟内直接复用，过期时先返回旧索引、后台再刷新。
+   */
+  warmUserIndex({ force = false } = {}) {
+    const ttl = 5 * 60 * 1000;
+    if (!force && this._userIndex && Date.now() - this._userIndexAt < ttl) {
+      return Promise.resolve(this._userIndex);
+    }
+    if (this._userIndexPromise) return this._userIndexPromise;
+    this._userIndexPromise = new Promise((resolve) => {
+      setImmediate(() => {
+        try {
+          this._userIndex = this._buildUserIndex();
+          this._userIndexAt = Date.now();
+          resolve(this._userIndex);
+        } catch (err) {
+          console.error('[用户索引] 构建失败：' + err.message);
+          resolve(this._userIndex || []);
+        } finally {
+          this._userIndexPromise = null;
+        }
+      });
+    });
+    return this._userIndexPromise;
+  }
+
+  _filterUsers(raw, limit) {
+    const q = raw.toLowerCase();
+    const rows = raw
+      ? this._userIndex.filter(
+          (u) => u.uid === raw || u.nn.toLowerCase().includes(q)
+        )
+      : this._userIndex;
+    return rows.slice(0, limit).map((u) => ({ ...u }));
+  }
+
   /** 昵称或 uid 模糊查找用户；q 为空时按发言量列出活跃用户 */
   findUsers(q, limit = 20) {
     const raw = String(q || '').trim();
+    const lim = Number(limit) || 20;
+    const ttl = 5 * 60 * 1000;
+    if (this._userIndex && Date.now() - this._userIndexAt < ttl) {
+      return this._filterUsers(raw, lim);
+    }
+    if (!this._userIndex) {
+      try {
+        this._userIndex = this._buildUserIndex();
+        this._userIndexAt = Date.now();
+      } catch (err) {
+        console.error('[用户索引] 构建失败，回退全表查询：' + err.message);
+      }
+    }
+    if (this._userIndex) {
+      if (Date.now() - this._userIndexAt >= ttl) this.warmUserIndex({ force: true });
+      return this._filterUsers(raw, lim);
+    }
+    // 索引建不起来时的兜底：保持旧行为，至少还能查
     if (!raw) {
       return this.db
         .prepare(
           `SELECT uid, nn, COUNT(*) AS n, MAX(cst) AS last, COUNT(DISTINCT rid) AS rooms
            FROM messages WHERE uid != '' GROUP BY uid ORDER BY n DESC LIMIT ?`
         )
-        .all(Number(limit));
+        .all(lim);
     }
     return this.db
       .prepare(
@@ -1779,7 +1938,7 @@ class Store {
          WHERE (uid = ? OR nn LIKE ?)
          GROUP BY uid, nn ORDER BY n DESC LIMIT ?`
       )
-      .all(raw, `%${raw}%`, Number(limit));
+      .all(raw, `%${raw}%`, lim);
   }
 
   stats() {

@@ -1851,6 +1851,11 @@ server.listen(PORT, HOST, async () => {
 
   collector.restore();
 
+  // 用户索引要全表聚合一次（约 3 秒），放到启动后后台做；之后 /api/users 直接读内存。
+  store.warmUserIndex().then((rows) => {
+    if (rows.length) console.log(`  ▶ 用户索引 ${rows.length} 人`);
+  }).catch(() => {});
+
   // 自愈：库里有大量弹幕却没有任何潮记录（外部合并/换库后常见），后台重建一次。
   // 不重建的话，检索面板会显示「弹幕潮 0 次」，看着像功能坏了。
   setTimeout(() => {

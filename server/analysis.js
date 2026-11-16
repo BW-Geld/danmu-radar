@@ -24,6 +24,11 @@ const STOP_TERMS = new Set(
 const clamp = (v, lo = 0, hi = 100) => Math.max(lo, Math.min(hi, v));
 const pct = (v) => Math.round(v * 100);
 
+// 同一条件重复检索很常见（改房间/翻回来看）；结果缓存 60 秒，避免每次都全表扫。
+const SEARCH_CACHE_TTL = 60 * 1000;
+const SEARCH_CACHE_MAX = 100;
+const SEARCH_CACHE = new Map();
+
 /** 把候选词修干净：剥边、去伪词、去功能词。返回 '' 表示丢弃。 */
 function cleanTerm(raw) {
   let s = raw;
@@ -179,6 +184,22 @@ function search(store, opts = {}) {
   const useSynonym = opts.synonym !== false;
   const useCooccur = opts.cooccur !== false;
 
+  const cacheKey = [
+    store.path || '',
+    raw,
+    limit,
+    rid || 0,
+    from || 0,
+    to || 0,
+    useSynonym ? 1 : 0,
+    useCooccur ? 1 : 0,
+    JSON.stringify(opts.lexiconExtra || null),
+  ].join('|');
+  const cached = SEARCH_CACHE.get(cacheKey);
+  if (cached && Date.now() - cached.at < SEARCH_CACHE_TTL) {
+    return { ...cached.value, cached: true, took: 0 };
+  }
+
   const synWords = useSynonym ? lexicon.synonymsOf(raw, opts.lexiconExtra) : [];
   const syn = synWords.map((w) => ({ word: w, norm: normalize(w) })).filter((s) => s.norm && s.norm !== exact);
 
@@ -236,13 +257,15 @@ function search(store, opts = {}) {
   // 用 exclude 做互斥，保证「共 N 条」是真实条数——否则 limit=5 时总数会被页面大小骗成 18。
   const synTerms = syn.map((s) => s.norm).filter(Boolean);
   const coocTerms = cooccur.map((c) => c.term);
-  const exactN = store.countByTerms([exact], { rid, from, to });
-  const synonymN = synTerms.length ? store.countByTerms(synTerms, { exclude: [exact], rid, from, to }) : 0;
-  const cooccurN = coocTerms.length
-    ? store.countByTerms(coocTerms, { exclude: [exact, ...synTerms], rid, from, to })
-    : 0;
-  const counts = { exact: exactN, synonym: synonymN, cooccur: cooccurN };
-  const total = exactN + synonymN + cooccurN;
+  const counts = store.countSearchTerms({
+    exact,
+    synonyms: synTerms,
+    cooccur: coocTerms,
+    rid,
+    from,
+    to,
+  });
+  const total = counts.exact + counts.synonym + counts.cooccur;
 
   // 列表按句聚合：弹幕潮里 24 个人刷同一句，逐条铺开等于没排序。
   // 条数是 SQL 真值（不是这一页），展开时才看具体是谁。
@@ -262,7 +285,7 @@ function search(store, opts = {}) {
         : { ...g, reason: '精确命中', reasonType: 'exact' };
     });
 
-  return {
+  const result = {
     ok: true,
     query: raw,
     terms: [raw, ...syn.map((s) => s.word)],
@@ -290,6 +313,11 @@ function search(store, opts = {}) {
       reasonType: r.reasonType,
     })),
   };
+  if (SEARCH_CACHE.size >= SEARCH_CACHE_MAX) {
+    SEARCH_CACHE.delete(SEARCH_CACHE.keys().next().value);
+  }
+  SEARCH_CACHE.set(cacheKey, { at: Date.now(), value: result });
+  return result;
 }
 
 // ---------------------------------------------------------------- 关键词推荐
@@ -481,7 +509,7 @@ function profile(store, uid, opts = {}) {
 
   // 采集缺口：断线期间的数据永久丢失，那段时间的「安静」不是用户不发言。
   // 所以有效采集时长要从跨度里扣掉缺口，频率类指标才有正确的分母。
-  const cov = store.coverage({ from: Number(totals.first), to: Number(totals.last) });
+  const cov = store.coverage({ from: Number(totals.first), to: Number(totals.last), known: totals });
   const effectiveHours = cov.effectiveMs / 3600000;
   const gapMinutes = Math.round(cov.gapMs / 60000);
 
