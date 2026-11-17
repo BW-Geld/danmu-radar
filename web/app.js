@@ -23,6 +23,13 @@ function sourceTag(src, tiny) {
   return h('span', `tag ${src === 'import' ? 'imp' : src}${tiny ? ' tiny' : ''}`, label);
 }
 
+// 画像里的历史弹幕滚动区：窗口 resize 只同步当前挂载的那一个，避免每次分析都累加监听
+let activeHistScroll = null;
+window.addEventListener('resize', () => {
+  if (!activeHistScroll || !activeHistScroll.isConnected) return;
+  activeHistScroll.classList.toggle('more', activeHistScroll.scrollHeight > activeHistScroll.clientHeight + 4);
+});
+
 const state = {
   rooms: [],
   liveRid: null,       // null = 全部房间
@@ -32,7 +39,7 @@ const state = {
   tab: 'live',
   liveTimer: null,
   stampBuckets: [],
-  prefs: { tlsel: {} }, // 服务端存的小状态（时间线选区），跨窗口一致
+  prefs: { tlsel: {}, fold: {}, boardLimit: 100 }, // 服务端存的小状态，跨窗口一致
 };
 
 // ------------------------------------------------------------ 基础工具
@@ -43,6 +50,36 @@ function toast(msg, isErr = false, ms = 2600) {
   t.className = 'toast show' + (isErr ? ' err' : '');
   clearTimeout(toast._t);
   toast._t = setTimeout(() => (t.className = 'toast'), ms);
+}
+
+/** 复制纯文本；剪贴板 API 不可用时退回 textarea。 */
+async function copyPlainText(text) {
+  const value = String(text == null ? '' : text);
+  if (!value) return false;
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(value);
+      return true;
+    }
+  } catch {
+    // 权限被拒或非安全上下文，继续走兜底
+  }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = value;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.top = '-1000px';
+    ta.style.opacity = '0';
+    document.body.append(ta);
+    ta.select();
+    ta.setSelectionRange(0, value.length);
+    const ok = document.execCommand('copy');
+    ta.remove();
+    return ok;
+  } catch {
+    return false;
+  }
 }
 
 async function api(path, opts = {}) {
@@ -246,13 +283,22 @@ async function refreshStats() {
 
 // ------------------------------------------------------------ 弹幕潮
 
+let burstSeq = 0;
+
 async function loadBursts() {
   const list = $('#burst-list');
   if (!list) return;
+  const seq = ++burstSeq;
+  list.textContent = '';
+  list.append(loadingBlock('正在读取弹幕潮…'));
+  const count = $('#burst-count');
+  if (count) count.textContent = '…';
   try {
     const url = `/api/floods?limit=8${state.liveRid ? '&rid=' + state.liveRid : ''}`;
     const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const d = await res.json();
+    if (seq !== burstSeq) return;
     const rows = d.rows || [];
     $('#burst-count').textContent = rows.length;
     list.textContent = '';
@@ -281,7 +327,10 @@ async function loadBursts() {
       list.append(item);
     }
   } catch (err) {
-    /* 网络抖动忽略，下次刷新再来 */
+    if (seq !== burstSeq) return;
+    if (count) count.textContent = '—';
+    list.textContent = '';
+    list.append(errorBlock('弹幕潮加载失败', err.message, () => loadBursts()));
   }
 }
 
@@ -421,14 +470,23 @@ function selectRoom(rid) {
   loadRecent();
 }
 
+let recentSeq = 0;
+
 async function loadRecent() {
+  const seq = ++recentSeq;
+  const list = $('#live-list');
+  list.textContent = '';
+  list.append(loadingBlock('正在加载最近弹幕…'));
   try {
     const qs = state.liveRid ? `?rid=${state.liveRid}&limit=150` : '?limit=150';
     const d = await api('/api/messages' + qs);
+    if (seq !== recentSeq) return;
     state.buffer = d.rows || [];
     renderLive(true);
-  } catch {
-    /* ignore */
+  } catch (err) {
+    if (seq !== recentSeq) return;
+    list.textContent = '';
+    list.append(errorBlock('最近弹幕加载失败', err.message, () => loadRecent()));
   }
 }
 
@@ -445,7 +503,22 @@ function msgNode(m) {
   nn.addEventListener('click', () => openUser(m.uid));
   row.append(nn);
   if (m.bnn) row.append(h('span', 'badge', m.bnn));
-  row.append(h('span', 'x', m.txt));
+  const body = h('span', 'x', m.txt);
+  body.classList.add('clickable');
+  body.title = '点击检索这句话';
+  body.tabIndex = 0;
+  body.setAttribute('role', 'button');
+  body.setAttribute('aria-label', '检索这句话');
+  const activate = () => {
+    const sel = window.getSelection();
+    if (sel && !sel.isCollapsed && body.contains(sel.anchorNode)) return;
+    searchFromMessage(m.txt);
+  };
+  body.addEventListener('click', activate);
+  body.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); activate(); }
+  });
+  row.append(body);
   return row;
 }
 
@@ -615,20 +688,44 @@ $('#q').addEventListener('keydown', (e) => {
 });
 $('#s-rid').addEventListener('change', loadKeywords);
 
-// 高频词推荐：当前房间最近 2 小时的头部词，点一下直接搜
+// 高频词推荐：当前房间最近一段时间的头部词，点一下直接搜
+// 范围只影响这一行推荐，不影响检索结果自己的时间下拉。
+const KW_RANGES = [[2, '2 小时'], [24, '1 天'], [168, '7 天'], [720, '30 天']];
+let kwHours = 2;
+let kwSeq = 0;
+
 async function loadKeywords() {
   const box = $('#s-keywords');
   if (!box) return;
+  const seq = ++kwSeq;
+  const rid = $('#s-rid').value;
+  const hours = kwHours;
+  const rangeLabel = (KW_RANGES.find(([h]) => h === hours) || KW_RANGES[0])[1];
+  const name = rid ? (state.rooms.find((r) => String(r.rid) === rid)?.name || rid) : '全部房间';
+
+  box.textContent = '';
+  const sel = h('select', 'select');
+  for (const [h, text] of KW_RANGES) sel.append(new Option(text, String(h)));
+  sel.value = String(hours);
+  sel.title = '高频词统计范围';
+  sel.addEventListener('change', () => {
+    kwHours = Number(sel.value) || 2;
+    loadKeywords();
+  });
+  const head = h('span', 'muted');
+  head.append(document.createTextNode(`${name} 最近 `), sel, document.createTextNode(' 高频：'));
+  box.append(head);
+  const status = h('span', 'muted', '正在统计…');
+  box.append(status);
+
   try {
-    const rid = $('#s-rid').value;
-    const d = await api(`/api/keywords?hours=2&limit=10${rid ? '&rid=' + rid : ''}`);
-    box.textContent = '';
+    const d = await api(`/api/keywords?hours=${hours}&limit=10${rid ? '&rid=' + rid : ''}`);
+    if (seq !== kwSeq) return;
+    status.remove();
     if (!d.terms.length) {
-      box.append(h('span', 'muted', '这个房间最近 2 小时还没有足够的高频词'));
+      box.append(h('span', 'muted', `${name} 最近 ${rangeLabel} 还没有足够的高频词`));
       return;
     }
-    const name = rid ? (state.rooms.find((r) => String(r.rid) === rid)?.name || rid) : '全部房间';
-    box.append(h('span', 'muted', `${name} 最近 2 小时高频：`));
     for (const t of d.terms) {
       const chip = h('button', 'chip', t.term);
       chip.title = `出现 ${t.n} 次，点击检索`;
@@ -639,7 +736,9 @@ async function loadKeywords() {
       box.append(chip);
     }
   } catch (err) {
-    box.textContent = '高频词加载失败：' + err.message;
+    if (seq !== kwSeq) return;
+    status.remove();
+    box.append(h('span', 'muted', '高频词加载失败：' + err.message));
   }
 }
 
@@ -671,29 +770,51 @@ function searchParams() {
   return params;
 }
 
+// 点实时弹幕正文：带着这句话跳到关键词检索
+function searchFromMessage(text) {
+  const q = String(text || '').trim();
+  if (!q) return;
+  $('#q').value = q;
+  switchTab('search');
+  window.scrollTo(0, 0);
+  runSearch();
+}
+
+let searchSeq = 0;
+
 async function runSearch() {
   const q = $('#q').value.trim();
   if (!q) {
     toast('先输入关键词');
     return;
   }
+  const seq = ++searchSeq;
   const btn = $('#s-btn');
   btn.disabled = true;
   btn.textContent = '检索中…';
   const summary = $('#s-summary');
   summary.textContent = '';
-  summary.append(h('span', 'tag', '正在召回…'));
+  summary.append(h('span', 'spinner'), h('span', 'tag', '正在召回…'));
+  const results = $('#s-results');
+  results.textContent = '';
+  results.append(loadingBlock('正在检索…'));
 
   try {
     const d = await api('/api/search?' + searchParams().toString());
+    if (seq !== searchSeq) return;
     renderSummary(d);
     renderResults(d);
   } catch (err) {
+    if (seq !== searchSeq) return;
     summary.textContent = '';
-    toast(err.message, true);
+    summary.append(h('span', 'tag bad', err.message));
+    results.textContent = '';
+    results.append(errorBlock('检索失败', err.message, () => runSearch()));
   } finally {
-    btn.disabled = false;
-    btn.textContent = '检索';
+    if (seq === searchSeq) {
+      btn.disabled = false;
+      btn.textContent = '检索';
+    }
   }
 }
 
@@ -739,6 +860,27 @@ function renderSummary(d) {
   box.append(h('span', 'tag', `${d.took} ms`));
 }
 
+// ------------------------------------------------------------ 加载/失败/空态
+function loadingBlock(text) {
+  const box = h('div', 'empty');
+  const line = h('p', '');
+  line.append(h('span', 'spinner'), document.createTextNode(' ' + text));
+  box.append(line);
+  return box;
+}
+
+function errorBlock(title, msg, onRetry) {
+  const box = h('div', 'empty');
+  box.append(h('p', 'big', title));
+  if (msg) box.append(h('p', '', msg));
+  if (onRetry) {
+    const retry = h('button', 'btn', '重试');
+    retry.addEventListener('click', onRetry);
+    box.append(retry);
+  }
+  return box;
+}
+
 // ------------------------------------------------------------ 检索结果展开（首发 / 谁在发）
 // origin 查询快、senders 查询慢：拆开请求，origin 先渲染，senders 后到再补。
 // 结果按说法缓存在这一轮检索里，收起再展开不重复打接口。
@@ -760,7 +902,7 @@ function paintOrigin(box, o, err) {
   const line = h('p', 'origin-line');
   line.append(document.createTextNode(COPY.fill(COPY.DETAIL.originWho, { who: f.nn || f.uid || '—' })));
   if (f.cst) {
-    const when = h('button', 'when-link', fmtTime(f.cst));
+    const when = h('button', 'when-link', `${fmtDate(f.cst)} ${fmtTime(f.cst)}`);
     when.title = '在时间线里看这前后 5 分钟';
     when.addEventListener('click', (ev) => {
       ev.stopPropagation();
@@ -826,9 +968,10 @@ function paintDetail(ent, detail) {
   detail.append(originBox, sendersBox);
 }
 
-function loadDetail(ent, key, detail) {
+function loadDetail(ent, key, rid, detail) {
   ent.loading = true;
-  const originReq = api(`/api/origin?txt=${encodeURIComponent(key)}`)
+  const room = rid ? `&rid=${encodeURIComponent(rid)}` : '';
+  const originReq = api(`/api/origin?txt=${encodeURIComponent(key)}${room}`)
     .then((o) => {
       ent.o = o;
       if (detail.isConnected && detail.dataset.open === '1') paintDetail(ent, detail);
@@ -837,7 +980,7 @@ function loadDetail(ent, key, detail) {
       ent.oErr = err;
       if (detail.isConnected && detail.dataset.open === '1') paintDetail(ent, detail);
     });
-  const sendersReq = api(`/api/senders?stem=${encodeURIComponent(key)}&limit=12`)
+  const sendersReq = api(`/api/senders?stem=${encodeURIComponent(key)}&limit=12${room}`)
     .then((s) => {
       ent.s = s;
       if (detail.isConnected && detail.dataset.open === '1') paintDetail(ent, detail);
@@ -869,16 +1012,38 @@ function renderResults(d) {
   for (const r of list) {
     const row = h('div', 'result');
     const who = h('div', 'who');
-    const nn = h('div', 'nn', r.nn || r.uid || (r.users ? `${r.users} 人在发` : '—'));
-    if (r.uid) nn.addEventListener('click', () => openUser(r.uid));
+    const firstUid = r.firstUid || r.uid || '';
+    const firstNn = r.firstNn || r.nn || '';
+    const nn = h('div', 'nn', firstNn || firstUid || (r.users ? `${r.users} 人在发` : '—'));
+    if (firstUid) nn.addEventListener('click', () => openUser(firstUid));
     who.append(nn);
     const metaText = r.room || (r.rid ? `#${r.rid}` : '');
     if (metaText) who.append(h('div', 'meta', metaText));
+    const firstCst = Number(r.firstCst) || Number(r.first) || 0;
+    if (firstCst) {
+      who.append(
+        h(
+          'div',
+          'meta',
+          COPY.fill(COPY.DETAIL.firstInRoom, {
+            date: fmtDate(firstCst),
+            time: fmtTime(firstCst),
+          })
+        )
+      );
+    }
     const body = h('div', 'body');
     const txtLine = h('div', 'txt');
     txtLine.append(h('span', null, r.disp || r.txt));
     txtLine.append(favButton(r));
     body.append(txtLine);
+    body.append(
+      h(
+        'div',
+        'hint sample-line',
+        COPY.fill(COPY.DETAIL.sampleFrom, { who: r.nn || r.uid || '—' })
+      )
+    );
     const why = h('div', 'why');
     const srcTag = sourceTag(r.source);
     if (srcTag) why.append(srcTag);
@@ -893,7 +1058,8 @@ function renderResults(d) {
     const detail = h('div', 'origin-box');
     const ask = h('button', 'origin-btn', COPY.DETAIL.expand);
     ask.title = COPY.DETAIL.title;
-    const key = r.stem || r.txt || String(r.id || '');
+    const stemKey = r.stem || r.txt || String(r.id || '');
+    const cacheKey = `${r.rid || 0}\u0000${stemKey}`;
     ask.addEventListener('click', () => {
       if (detail.dataset.open === '1') {
         detail.dataset.open = '0';
@@ -903,14 +1069,14 @@ function renderResults(d) {
       }
       detail.dataset.open = '1';
       ask.textContent = COPY.DETAIL.collapse;
-      let ent = detailCache.get(key);
+      let ent = detailCache.get(cacheKey);
       if (!ent) {
         ent = {};
-        detailCache.set(key, ent);
+        detailCache.set(cacheKey, ent);
       }
       paintDetail(ent, detail);
       const settled = (ent.o !== undefined || ent.oErr) && (ent.s !== undefined || ent.sErr);
-      if (!ent.loading && !settled) loadDetail(ent, key, detail);
+      if (!ent.loading && !settled) loadDetail(ent, stemKey, r.rid, detail);
     });
     body.append(why, ask, detail);
     const tm = h('div', 'tm', r.n > 1 ? `${fmtTime(r.last)} 最后` : fmtTime(r.cst || r.last));
@@ -930,12 +1096,13 @@ function todayStr() {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 }
 
-function boardQuery() {
+function boardQuery(fresh = false) {
   const p = new URLSearchParams();
   p.set('limit', String(state.board.limit));
   // today / date / all 三种口径，服务端都有对应分支
   if (state.board.mode === 'all') p.set('today', '0');
   else if (state.board.mode === 'date') p.set('date', state.board.date || todayStr());
+  if (fresh) p.set('fresh', '1');
   const rid = $('#b-rid').value;
   if (rid) p.set('rid', rid);
   return p.toString();
@@ -1000,7 +1167,9 @@ function renderBoard(d) {
   const scope = d.date
     ? (d.date === todayStr() ? `今天（${d.date}）00:00 起` : `${d.date} 全天`)
     : '全部时段';
-  $('#b-users-meta').textContent = scope;
+  $('#b-users-meta').textContent = scope + (d.usersAsOf
+    ? ` · 发言数截至 ${fmtDate(d.usersAsOf) === fmtDate(Date.now()) ? fmtTime(d.usersAsOf) : fmtDate(d.usersAsOf) + ' ' + fmtTime(d.usersAsOf)}`
+    : '');
   $('#b-phrases-meta').textContent = scope;
 
   if (!d.users.length) ub.append(h('li', 'empty small', '这段时间还没人说话'));
@@ -1050,20 +1219,42 @@ function renderBoard(d) {
   });
 }
 
-async function loadBoard() {
+let boardSeq = 0;
+
+function setBoardLoading(on) {
+  const spin = $('#b-spin');
+  if (spin) spin.hidden = !on;
+  const btn = $('#b-btn');
+  if (btn) btn.disabled = on;
+}
+
+async function loadBoard({ fresh = false } = {}) {
+  const seq = ++boardSeq;
+  setBoardLoading(true);
   try {
-    renderBoard(await api(`/api/board?${boardQuery()}`));
+    const d = await api(`/api/board?${boardQuery(fresh)}`);
+    if (seq !== boardSeq) return;
+    renderBoard(d);
   } catch (e) {
-    const ub = $('#b-users');
-    ub.textContent = '';
-    ub.append(h('li', 'empty small', '读取失败：' + e.message));
+    if (seq !== boardSeq) return;
+    for (const id of ['#b-users', '#b-phrases']) {
+      const box = $(id);
+      if (!box) continue;
+      box.textContent = '';
+      box.append(h('li', 'empty small', '读取失败：' + e.message));
+    }
+  } finally {
+    if (seq === boardSeq) setBoardLoading(false);
   }
 }
 
-$('#b-btn').addEventListener('click', loadBoard);
-$('#b-rid').addEventListener('change', loadBoard);
+$('#b-btn').addEventListener('click', () => loadBoard({ fresh: true }));
+$('#b-rid').addEventListener('change', () => loadBoard());
 $('#b-limit').addEventListener('change', () => {
-  state.board.limit = Number($('#b-limit').value) || 20;
+  const n = Number($('#b-limit').value) || 20;
+  state.board.limit = n;
+  state.prefs.boardLimit = n;
+  savePrefsSoon();
   loadBoard();
 });
 $('#b-date').addEventListener('change', () => {
@@ -1222,12 +1413,19 @@ async function loadPrefs() {
   try {
     const d = await api('/api/prefs');
     const p = d.prefs && typeof d.prefs === 'object' ? d.prefs : {};
+    const boardLimit = Number(p.boardLimit);
     state.prefs = {
       tlsel: p.tlsel && typeof p.tlsel === 'object' ? p.tlsel : {},
       fold: p.fold && typeof p.fold === 'object' ? p.fold : {},
+      boardLimit: Number.isFinite(boardLimit) && boardLimit > 0 ? boardLimit : 100,
     };
+    if ([20, 50, 100].includes(state.prefs.boardLimit)) {
+      state.board.limit = state.prefs.boardLimit;
+      const sel = $('#b-limit');
+      if (sel) sel.value = String(state.board.limit);
+    }
   } catch {
-    state.prefs = { tlsel: {}, fold: {} };
+    state.prefs = { tlsel: {}, fold: {}, boardLimit: 100 };
   }
   renderFollows();
 }
@@ -1521,22 +1719,32 @@ async function resolveUserInput(raw) {
   return String(pick.uid);
 }
 
+let profileSeq = 0;
+
 async function runProfile(uid) {
   if (!uid) {
     toast('请输入 UID 或昵称');
     return;
   }
+  const seq = ++profileSeq;
   const btn = $('#u-btn');
   btn.disabled = true;
   btn.textContent = '分析中…';
+  const box = $('#u-result');
+  box.textContent = '';
+  box.append(loadingBlock('正在分析…'));
   try {
     const d = await api('/api/users/' + encodeURIComponent(await resolveUserInput(uid)));
+    if (seq !== profileSeq) return;
     renderProfile(d);
   } catch (err) {
+    if (seq !== profileSeq) return;
     renderProfileError(err.message);
   } finally {
-    btn.disabled = false;
-    btn.textContent = '分析';
+    if (seq === profileSeq) {
+      btn.disabled = false;
+      btn.textContent = '分析';
+    }
   }
 }
 
@@ -2000,7 +2208,7 @@ function renderProfile(d) {
   function syncHistFade() {
     histScroll.classList.toggle('more', histScroll.scrollHeight > histScroll.clientHeight + 4);
   }
-  window.addEventListener('resize', syncHistFade);
+  activeHistScroll = histScroll;
 
   async function histLoad(reset) {
     if (hist.busy) return;
@@ -2172,16 +2380,32 @@ function syncFavKeys() {
   fav.keys = new Set(fav.items.map((f) => `${Number(f.rid)}|${f.stem}`));
 }
 
+let favSeq = 0;
+
 async function loadFavorites() {
+  const seq = ++favSeq;
+  const list = $('#f-list');
+  const count = $('#f-count');
+  if (count) count.textContent = '加载中…';
+  if (list) {
+    list.textContent = '';
+    list.append(loadingBlock('正在加载收藏…'));
+  }
   try {
     const d = await api('/api/favorites');
+    if (seq !== favSeq) return;
     fav.items = d.items || [];
     syncFavKeys();
     renderFavorites();
     // 别的页面（检索结果、排行榜、时间线）上的星标也要立刻对上状态
     refreshFavButtons();
   } catch (err) {
-    toast(err.message, true);
+    if (seq !== favSeq) return;
+    if (count) count.textContent = '加载失败';
+    if (list) {
+      list.textContent = '';
+      list.append(errorBlock('收藏夹加载失败', err.message, () => loadFavorites()));
+    }
   }
 }
 
@@ -2325,6 +2549,15 @@ function renderFavorites() {
     main.append(sub);
     row.append(main);
 
+    const actions = h('div', 'fav-actions');
+    const copy = h('button', 'btn ghost tiny', '复制');
+    copy.title = '复制这句话';
+    copy.addEventListener('click', async () => {
+      copy.disabled = true;
+      const ok = await copyPlainText(it.txt || it.stem || '');
+      copy.disabled = false;
+      toast(ok ? '已复制' : '复制失败，请手动选择文本', !ok);
+    });
     const del = h('button', 'btn ghost tiny', '取消收藏');
     del.addEventListener('click', async () => {
       del.disabled = true;
@@ -2338,7 +2571,8 @@ function renderFavorites() {
         del.disabled = false;
       }
     });
-    row.append(del);
+    actions.append(copy, del);
+    row.append(actions);
     box.append(row);
   }
 }
@@ -2369,6 +2603,19 @@ $('#lib-anon').addEventListener('change', () => {
   note.className = anon ? 'hint' : 'hint warn';
 });
 
+$('#lib-range').addEventListener('change', () => {
+  const custom = $('#lib-range').value === 'custom';
+  $('#lib-custom').hidden = !custom;
+  if (custom) $('#lib-from').focus();
+});
+
+$('#lib-from').addEventListener('input', () => {
+  $('#lib-export-status').textContent = '';
+});
+$('#lib-to').addEventListener('input', () => {
+  $('#lib-export-status').textContent = '';
+});
+
 $('#lib-export').addEventListener('click', async () => {
   const anon = $('#lib-anon').checked;
   if (!anon && !confirm('这个库包会带上 UID 和昵称。\n\n只建议在自己设备之间同步，确定导出吗？')) return;
@@ -2377,7 +2624,26 @@ $('#lib-export').addEventListener('click', async () => {
   const q = new URLSearchParams();
   if (rid) q.set('rid', rid);
   q.set('anon', anon ? '1' : '0');
-  if (range !== 'all') {
+  if (range === 'custom') {
+    const fromRaw = $('#lib-from').value;
+    const toRaw = $('#lib-to').value;
+    const from = fromRaw ? new Date(fromRaw).getTime() : null;
+    const to = toRaw ? new Date(toRaw).getTime() : null;
+    if ((fromRaw && !Number.isFinite(from)) || (toRaw && !Number.isFinite(to))) {
+      $('#lib-export-status').textContent = '时间格式不对';
+      return;
+    }
+    if (from != null && to != null && from >= to) {
+      $('#lib-export-status').textContent = '起始时间必须早于结束时间';
+      return;
+    }
+    if (from == null && to == null) {
+      $('#lib-export-status').textContent = '自定义时间至少填一个起止时间';
+      return;
+    }
+    if (from != null) q.set('from', String(from));
+    if (to != null) q.set('to', String(to));
+  } else if (range !== 'all') {
     const now = Date.now();
     const day = Math.floor(now / 86400000) * 86400000;
     if (range === 'today') q.set('from', String(day));
@@ -2987,11 +3253,14 @@ function renderTimelineRows(d, range) {
 }
 
 // 本场看点：斗鱼 AI 生成的片段，接口要房间正在播才有内容
+let highlightSeq = 0;
+
 async function loadHighlights() {
   const card = $('#t-hl-card');
   const listBox = $('#t-hl-list');
   const count = $('#t-hl-count');
   const rid = $('#t-rid').value;
+  const seq = ++highlightSeq;
   card.hidden = false;
   if (!rid) {
     // 保留卡片外壳：直接隐藏会让人以为功能没了
@@ -3005,6 +3274,7 @@ async function loadHighlights() {
   listBox.textContent = '';
   try {
     const d = await api(`/api/highlights?rid=${rid}&date=${date}`);
+    if (seq !== highlightSeq) return;
     if (!d.ok) {
       count.textContent = '取不到：' + (d.error || '斗鱼没返回数据');
       return;
@@ -3060,18 +3330,28 @@ async function loadHighlights() {
     }
     listBox.append(frag);
   } catch (err) {
+    if (seq !== highlightSeq) return;
     count.textContent = '看点加载失败：' + err.message;
   }
 }
+
+let timelineSeq = 0;
 
 async function loadTimeline() {
   const dateInput = $('#t-date');
   if (!dateInput.value) dateInput.value = fmtDate(Date.now());
   const rid = $('#t-rid').value;
   const readout = $('#t-readout');
+  const seq = ++timelineSeq;
+  readout.textContent = '';
+  readout.append(h('span', 'spinner'), document.createTextNode(' 加载中…'));
+  const resultBox = $('#t-results');
+  resultBox.textContent = '';
+  resultBox.append(loadingBlock('正在读取这一天…'));
   loadHighlights();
   try {
     const d = await api(`/api/timeline?date=${dateInput.value}${rid ? '&rid=' + rid : ''}`);
+    if (seq !== timelineSeq) return;
     tl.data = d;
     tl.drag = null;
     dateInput.value = d.date;
@@ -3097,7 +3377,12 @@ async function loadTimeline() {
     e.append(h('p', 'muted small', '排序是重复次数，所以整场只说过一次的话会排在最后。'));
     box.append(e);
   } catch (err) {
+    if (seq !== timelineSeq) return;
     readout.textContent = '时间线加载失败：' + err.message;
+    $('#t-summary').textContent = '';
+    const box = $('#t-results');
+    box.textContent = '';
+    box.append(errorBlock('时间线加载失败', err.message, () => loadTimeline()));
   }
 }
 

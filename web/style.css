@@ -237,6 +237,7 @@ code {
   background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px;
 }
 .fav-main { min-width: 0; flex: 1; }
+.fav-actions { display: flex; gap: 6px; flex-shrink: 0; }
 .fav-title {
   display: block; width: 100%; text-align: left; background: none; border: 0; padding: 0;
   color: var(--text); font: inherit; font-size: 14px; cursor: pointer;
@@ -247,6 +248,13 @@ code {
 .fav-plus1 { font-variant-numeric: tabular-nums; }
 .fav-tools { flex-wrap: wrap; }
 .btn.tiny { padding: 3px 10px; font-size: 11px; }
+.spinner {
+  display: inline-block; width: 13px; height: 13px; vertical-align: -2px;
+  border: 2px solid var(--line); border-top-color: var(--accent);
+  border-radius: 50%; animation: spin .7s linear infinite;
+}
+.spinner[hidden] { display: none; }
+@keyframes spin { to { transform: rotate(360deg); } }
 .origin-box:empty { display: none; }
 .origin-box {
   margin-top: 6px;
@@ -361,6 +369,9 @@ code {
 .msg .n:hover { text-decoration: underline; }
 .msg .lv { color: #6b7c91; font-size: 10px; border: 1px solid #263140; border-radius: 4px; padding: 0 4px; flex: none; }
 .msg .x { flex: 1; word-break: break-word; }
+.msg .x.clickable { cursor: pointer; }
+.msg .x.clickable:hover { color: var(--accent); text-decoration: underline; }
+.msg .x.clickable:focus-visible { outline: 1px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
 .msg .badge { color: var(--warn); font-size: 10px; flex: none; opacity: .85; }
 .msg.enter .x { color: #5d7188; font-style: italic; }
 .toolbar-row { display: flex; gap: 8px; }
@@ -379,6 +390,7 @@ code {
 .search-opts { display: flex; align-items: center; gap: 18px; margin-top: 12px; flex-wrap: wrap; }
 .search-opts .select { padding: 5px 8px; font-size: 12px; }
 .examples { display: flex; align-items: center; gap: 8px; margin-top: 12px; flex-wrap: wrap; font-size: 12px; }
+.examples .select { padding: 2px 4px; font-size: 12px; }
 .chip {
   border: 1px solid var(--line); background: transparent; color: var(--muted);
   border-radius: 20px; padding: 3px 11px; font-size: 12px; cursor: pointer;
@@ -411,6 +423,7 @@ code {
 .result .body { min-width: 0; }
 .result .body .txt { word-break: break-word; }
 .result .body .why { margin-top: 4px; font-size: 11px; color: var(--muted); }
+.result .body .sample-line { margin-top: 2px; font-size: 11px; }
 .result .body .why em { color: var(--accent); font-style: normal; }
 .result .tm { color: #566578; font-size: 11px; white-space: nowrap; font-variant-numeric: tabular-nums; }
 
@@ -683,6 +696,9 @@ code {
 /* ---------------- 璁剧疆 ---------------- */
 
 .row-inline { display: flex; align-items: center; gap: 8px; margin-top: 14px; }
+.lib-custom { flex-wrap: wrap; }
+.lib-custom[hidden] { display: none; }
+.lib-custom .text-input { flex: 0 1 210px; min-width: 190px; }
 .row-inline .mini-input { width: 80px; }
 .kv + .row-inline { margin-top: 16px; }
 

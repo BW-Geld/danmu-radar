@@ -187,7 +187,7 @@
     </div>
     <div class="grid2">
       <div class="card">
-        <h3>发言榜 <span class="muted small" id="b-users-meta"></span></h3>
+        <h3>发言榜 <span class="muted small" id="b-users-meta"></span> <span class="spinner" id="b-spin" hidden></span></h3>
         <ol class="board" id="b-users">
           <li class="empty small">还没有数据</li>
         </ol>
@@ -332,10 +332,18 @@
             <option value="today">今天</option>
             <option value="7">最近 7 天</option>
             <option value="30">最近 30 天</option>
+            <option value="custom">自定义时间…</option>
           </select>
           <label class="switch"><input type="checkbox" id="lib-anon" checked> 匿名导出（推荐）</label>
           <button class="btn primary" id="lib-export">导出库包</button>
           <span class="hint" id="lib-export-status"></span>
+        </div>
+        <div class="row-inline lib-custom" id="lib-custom" hidden>
+          <label>起</label>
+          <input type="datetime-local" id="lib-from" class="text-input">
+          <label>止</label>
+          <input type="datetime-local" id="lib-to" class="text-input">
+          <span class="hint">止不含；留空表示不限制</span>
         </div>
         <p class="hint" id="lib-anon-note">
           <strong>匿名库包</strong>里没有 <strong>UID</strong> 也没有<strong>昵称</strong>：每条弹幕的 uid 写成 0、昵称写成「匿名」，

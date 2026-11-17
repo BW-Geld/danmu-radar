@@ -64,6 +64,7 @@ function readPrefs() {
 }
 
 function writePrefs(prefs) {
+  const out = {};
   const tl = (prefs && prefs.tlsel) || {};
   const keys = Object.keys(tl).slice(-400); // 只留最近 400 个选区，别让 meta 无限涨
   const slim = {};
@@ -73,7 +74,18 @@ function writePrefs(prefs) {
     const b = Number(v.b);
     if (Number.isFinite(a) && Number.isFinite(b)) slim[k] = { a, b };
   }
-  store.metaSet('prefs', JSON.stringify({ tlsel: slim }));
+  out.tlsel = slim;
+  // 折叠状态前端一直在读，之前 writePrefs 会把它丢掉；顺手保留。
+  const fold = prefs && prefs.fold;
+  if (fold && typeof fold === 'object') {
+    const fslim = {};
+    for (const k of Object.keys(fold).slice(0, 100)) fslim[k] = !!fold[k];
+    out.fold = fslim;
+  }
+  // 排行榜「前多少」：持久化到服务端，独立窗口/浏览器都能读到。
+  const lim = Math.round(Number(prefs && prefs.boardLimit));
+  if (Number.isFinite(lim) && lim > 0) out.boardLimit = Math.max(1, Math.min(500, lim));
+  store.metaSet('prefs', JSON.stringify(out));
 }
 
 const collector = new Collector(store, {
@@ -436,10 +448,25 @@ function stamp() {
 }
 
 /** 加 BOM，Excel 直接双击打开中文不乱码 */
-function sendCsv(res, filename, rows) {
-  const lines = [CSV_HEAD.join(',')];
+async function sendCsv(res, filename, rows) {
+  res.writeHead(200, {
+    'content-type': 'text/csv; charset=utf-8',
+    'content-disposition': `attachment; filename="${filename}"`,
+    'cache-control': 'no-store',
+  });
+  // 分块写出，避免把所有行再拼成一个巨大的字符串；客户端断开就停。
+  const write = async (s) => {
+    if (res.destroyed || res.writableEnded) return false;
+    if (!res.write(s)) {
+      await Promise.race([once(res, 'drain'), once(res, 'close')]);
+      if (res.destroyed) return false;
+    }
+    return true;
+  };
+  if (!(await write('\uFEFF' + CSV_HEAD.join(',') + '\r\n'))) return;
+  let chunk = [];
   for (const r of rows) {
-    lines.push(
+    chunk.push(
       [
         new Date(Number(r.cst) || 0).toLocaleString('zh-CN', { hour12: false }),
         r.room_name,
@@ -454,14 +481,13 @@ function sendCsv(res, filename, rows) {
         .map(csvCell)
         .join(',')
     );
+    if (chunk.length >= 500) {
+      if (!(await write(chunk.join('\r\n') + '\r\n'))) return;
+      chunk = [];
+    }
   }
-  const body = '\uFEFF' + lines.join('\r\n');
-  res.writeHead(200, {
-    'content-type': 'text/csv; charset=utf-8',
-    'content-disposition': `attachment; filename="${filename}"`,
-    'cache-control': 'no-store',
-  });
-  res.end(body);
+  if (chunk.length && (await write(chunk.join('\r\n') + '\r\n'))) res.end();
+  else if (!res.writableEnded) res.end();
 }
 
 /** 把请求体流式落盘，避免 512MB 库包先整块进内存。 */
@@ -720,8 +746,9 @@ async function handleApi(req, res, url) {
 
   // 首发查询：这句话在本房间最早是谁说的、被 +1 了多少次
   if (p === '/origin' && req.method === 'GET') {
-    const txt = q.get('txt') || q.get('stem') || '';
+    const txt = (q.get('txt') || q.get('stem') || '').trim();
     if (!txt) return json(res, 400, { ok: false, error: '缺少 phrases' });
+    if (txt.length > 200) return json(res, 400, { ok: false, error: '内容太长（最多 200 字）' });
     const info = store.originOf(txt, {
       rid: q.get('rid') ? Number(q.get('rid')) : 0,
       by: q.get('by') === 'ntxt' ? 'ntxt' : 'stem',
@@ -732,14 +759,17 @@ async function handleApi(req, res, url) {
 
   // 这句话是谁在发：给检索列表里「×24 条」一个可核对的下钻
   if (p === '/senders' && req.method === 'GET') {
-    const g = q.get('stem') || q.get('txt') || '';
+    const g = (q.get('stem') || q.get('txt') || '').trim();
     if (!g) return json(res, 400, { ok: false, error: '缺少 stem' });
+    if (g.length > 200) return json(res, 400, { ok: false, error: '内容太长（最多 200 字）' });
+    const rawLimit = Number(q.get('limit'));
+    const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(Math.floor(rawLimit), 100)) : 20;
     return json(res, 200, {
       ok: true,
       stem: g,
       senders: store.sendersOfStem(g, {
         rid: q.get('rid') ? Number(q.get('rid')) : 0,
-        limit: Number(q.get('limit')) || 20,
+        limit,
       }),
     });
   }
@@ -779,13 +809,17 @@ async function handleApi(req, res, url) {
     const win = allTime
       ? { rid, from: null, to: null, limit }
       : { rid, from: day.from, to: dateArg ? day.to : Date.now(), limit };
+    const fresh = q.get('fresh') === '1';
     return json(res, 200, {
       ok: true,
       date: day ? day.date : null,
       from: win.from,
       to: win.to,
       users: store.topSenders(win),
-      phrases: store.topPlusOne(win),
+      // 只有「全部时段 + 全部房间」走内存索引；标出发言数的截至时间，避免误以为是实时值。
+      usersAsOf: allTime && !rid ? store.userIndexAsOf() : null,
+      // 今天的榜本身很快，不缓存；全部/指定日期缓存 60 秒，刷新按钮用 fresh=1 绕过。
+      phrases: store.topPlusOne({ ...win, cache: !day, fresh }),
     });
   }
 
@@ -907,13 +941,18 @@ async function handleApi(req, res, url) {
   }
 
   // 检索
-  if (p === '/search' && req.method === 'GET') {    const keyword = q.get('q') || '';
+  if (p === '/search' && req.method === 'GET') {
+    const keyword = (q.get('q') || '').trim();
+    if (!keyword) return json(res, 400, { ok: false, error: '缺少关键词' });
+    if (keyword.length > 200) return json(res, 400, { ok: false, error: '关键词太长（最多 200 字）' });
+    const rawLimit = Number(q.get('limit'));
+    const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(Math.floor(rawLimit), 1000)) : 200;
     const result = analysis.search(store, {
       q: keyword,
       rid: q.get('rid') ? Number(q.get('rid')) : null,
       from: q.get('from') ? Number(q.get('from')) : null,
       to: q.get('to') ? Number(q.get('to')) : null,
-      limit: q.get('limit') ? Number(q.get('limit')) : 200,
+      limit,
       synonym: q.get('synonym') !== '0',
       cooccur: q.get('cooccur') !== '0',
       log: (m) => console.warn(`[检索] ${m}`),
@@ -925,6 +964,7 @@ async function handleApi(req, res, url) {
   if (p === '/export/search' && req.method === 'GET') {
     const keyword = (q.get('q') || '').trim();
     if (!keyword) return json(res, 400, { ok: false, error: '缺少关键词' });
+    if (keyword.length > 200) return json(res, 400, { ok: false, error: '关键词太长（最多 200 字）' });
     const exact = normalize(keyword);
     const useSyn = q.get('synonym') !== '0';
     const syn = useSyn ? lexicon.synonymsOf(keyword) : [];
@@ -944,7 +984,8 @@ async function handleApi(req, res, url) {
   // 导出某个用户的全部弹幕（CSV）
   const exportUser = p.match(/^\/export\/user\/(.+)$/);
   if (exportUser && req.method === 'GET') {
-    const uid = decodeURIComponent(exportUser[1]);
+    const uid = decodeURIComponent(exportUser[1]).trim();
+    if (!uid || uid.length > 128) return json(res, 400, { ok: false, error: 'UID 不合法' });
     const rows = store.userMessages(uid, { limit: 200000, cap: 200000 });
     if (!rows.length) return json(res, 404, { ok: false, error: '本地没有该用户的弹幕' });
     console.log(`[导出] 用户 ${uid} → ${rows.length} 条`);
@@ -953,12 +994,15 @@ async function handleApi(req, res, url) {
 
   // 用户
   if (p === '/users' && req.method === 'GET') {
-    return json(res, 200, { ok: true, users: store.findUsers(q.get('q') || '', 20) });
+    const kw = (q.get('q') || '').trim();
+    if (kw.length > 100) return json(res, 400, { ok: false, error: '查询太长（最多 100 字）' });
+    return json(res, 200, { ok: true, users: store.findUsers(kw, 20) });
   }
 
   const userMatch = p.match(/^\/users\/([^/]+)$/);
   if (userMatch && req.method === 'GET') {
-    const uid = decodeURIComponent(userMatch[1]);
+    const uid = decodeURIComponent(userMatch[1]).trim();
+    if (!uid || uid.length > 128) return json(res, 400, { ok: false, error: 'UID 不合法' });
     const result = analysis.profile(store, uid);
     if (result.ok) Object.assign(result, store.followState(uid));
     return json(res, result.ok ? 200 : 404, result);

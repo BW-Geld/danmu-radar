@@ -388,6 +388,8 @@ class Store {
     // 房间汇总也是全表 GROUP BY rid；/api/stats 和 /api/rooms 都会调，和 stats 一起缓存。
     this._roomSummaryCache = null;
     this._roomSummaryAt = 0;
+    // 排行榜说法聚合一次约 1 秒；60 秒内复用，手动刷新可绕过。
+    this._phraseCache = new Map();
     this._affixBusy = false;
   }
 
@@ -397,6 +399,7 @@ class Store {
     this._statsAt = 0;
     this._roomSummaryCache = null;
     this._roomSummaryAt = 0;
+    this._phraseCache.clear();
   }
 
   /** 兼容外部显式初始化调用 */
@@ -1198,76 +1201,60 @@ class Store {
       where.push('cst <= ?');
       args.push(Number(to));
     }
+    // 组 = 房间 + 说法。同一句话在两个房间刷，分别成行，统计不混。
     const groups = this.db
       .prepare(
-        `SELECT COALESCE(NULLIF(stem, ''), txt) AS g, COUNT(*) AS n, COUNT(DISTINCT uid) AS u,
+        `SELECT rid, COALESCE(NULLIF(stem, ''), txt) AS g, COUNT(*) AS n, COUNT(DISTINCT uid) AS u,
                 MIN(cst) AS f, MAX(cst) AS l
          FROM messages WHERE ${where.join(' AND ')}
-         GROUP BY g ORDER BY n DESC, l DESC LIMIT ?`
+         GROUP BY rid, g ORDER BY n DESC, l DESC LIMIT ?`
       )
       .all(...args, Math.min(Number(limit) || 40, 200));
 
-    // 样本取法：一次 IN 查询把前 N 组的最新若干行全取回来，再在内存里挑每组的「最长那一版」。
-    // 原来是对每组各跑一次 `WHERE COALESCE(NULLIF(stem,''),txt) = ?`——表达式用不上索引，
-    // 等于每组一次全表扫，40 组就是 40 次扫，测出来 322ms 全耗在这。
-    const keys = groups.map((g) => g.g);
+    // 样本与归属分开：
+    // - 样本（列表正文/「样本取自」）仍取每组最长的那一版；
+    // - 归属（左侧「本房间最早」）取组内 cst 最小的一行。
+    // 两个窗口函数在同一个扫描里各取一条，避免为「最早」再扫一遍全表。
     const samples = new Map();
-    if (keys.length) {
-      const marks = keys.map(() => '?').join(',');
+    const firsts = new Map();
+    if (groups.length) {
       const rows = this.db
         .prepare(
-          `SELECT COALESCE(NULLIF(stem, ''), txt) AS g, id, rid, room_name, uid, nn, txt, cst, level, bnn, bl, source
-           FROM messages
-           WHERE (stem IN (${marks}) OR ((stem IS NULL OR stem = '') AND txt IN (${marks})))
-             AND kind = 'chat'
-           ORDER BY cst DESC
-           LIMIT ?`
+          `SELECT * FROM (
+             SELECT rid, COALESCE(NULLIF(stem, ''), txt) AS g, id, room_name, uid, nn, txt, cst,
+                    level, bnn, bl, source,
+                    ROW_NUMBER() OVER (
+                      PARTITION BY rid, COALESCE(NULLIF(stem, ''), txt)
+                      ORDER BY LENGTH(txt) DESC, cst DESC
+                    ) AS rn_sample,
+                    ROW_NUMBER() OVER (
+                      PARTITION BY rid, COALESCE(NULLIF(stem, ''), txt)
+                      ORDER BY cst ASC, id ASC
+                    ) AS rn_first
+             FROM messages WHERE ${where.join(' AND ')}
+           ) WHERE rn_sample = 1 OR rn_first = 1`
         )
-        .all(...keys, ...keys, Math.min(keys.length * 30, 4000));
+        .all(...args);
       for (const r of rows) {
-        const cur = samples.get(r.g);
-        if (!cur) samples.set(r.g, r);
-        else if ((r.txt || '').length > (cur.txt || '').length) samples.set(r.g, r);
-      }
-
-      // 上面那次是全局取前 N 行，长尾分组可能一条都挤不进来，
-      // 结果 group 里没有 rid/room/nn，界面就会显示「—」和「#undefined」。
-      // 对没取到样本的分组再补一次，用窗口函数保证每组恰好取一条最长样本。
-      const missing = keys.filter((k) => !samples.has(k));
-      if (missing.length) {
-        const again = this.db
-          .prepare(
-            `SELECT * FROM (
-               SELECT COALESCE(NULLIF(stem, ''), txt) AS g, id, rid, room_name, uid, nn, txt, cst,
-                      level, bnn, bl, source,
-                      ROW_NUMBER() OVER (
-                        PARTITION BY COALESCE(NULLIF(stem, ''), txt)
-                        ORDER BY LENGTH(txt) DESC, cst DESC
-                      ) AS rn
-               FROM messages
-               WHERE kind = 'chat'
-                 AND (stem IN (${missing.map(() => '?').join(',')})
-                   OR ((stem IS NULL OR stem = '') AND txt IN (${missing.map(() => '?').join(',')})))
-             ) WHERE rn = 1`
-          )
-          .all(...missing, ...missing);
-        for (const r of again) {
-          if (!samples.has(r.g)) samples.set(r.g, r);
-        }
+        const k = `${r.rid}\u0000${r.g}`;
+        if (Number(r.rn_sample) === 1) samples.set(k, r);
+        if (Number(r.rn_first) === 1) firsts.set(k, r);
       }
     }
 
     return groups.map((g) => {
-      const sample = samples.get(g.g) || { txt: g.g, cst: g.f };
+      const k = `${g.rid}\u0000${g.g}`;
+      const sample = samples.get(k) || { txt: g.g, cst: g.f, rid: g.rid };
+      const first = firsts.get(k) || sample;
       return {
         stem: g.g,
         n: Number(g.n),
         users: Number(g.u),
         first: Number(g.f),
         last: Number(g.l),
+        rid: Number(g.rid),
+        room: sample.room_name || first.room_name || '',
         id: sample.id,
-        rid: sample.rid,
-        room: sample.room_name,
         uid: sample.uid,
         nn: sample.nn,
         txt: sample.txt,
@@ -1276,6 +1263,11 @@ class Store {
         level: sample.level,
         badge: sample.bnn ? `${sample.bnn} ${sample.bl}` : '',
         source: sample.source,
+        firstUid: first.uid || '',
+        firstNn: first.nn || '',
+        firstTxt: first.txt || '',
+        firstCst: Number(first.cst) || Number(g.f),
+        firstRoom: first.room_name || sample.room_name || '',
       };
     });
   }
@@ -1312,6 +1304,35 @@ class Store {
    * 按 uid 聚合，昵称取最后一次出现（改名后以新昵称为准），同时给出跨了几个房间。
    */
   topSenders({ rid, from, to, limit = 20 } = {}) {
+    const lim = Math.min(Number(limit) || 20, 100);
+    // 全部时间、全部房间：直接复用启动时建好的用户索引，避免每次 GROUP BY 30 万行。
+    // 指定房间或时间段仍走 SQL（索引没有 rid/时间维度）。
+    if (!rid && from == null && to == null) {
+      try {
+        const idx = this._userIndex || this._buildUserIndex();
+        if (!this._userIndex) {
+          this._userIndex = idx;
+          this._userIndexAt = Date.now();
+        } else if (Date.now() - this._userIndexAt >= 5 * 60 * 1000) {
+          this.warmUserIndex({ force: true });
+        }
+        return idx
+          .filter((u) => u.chatN > 0)
+          .sort((a, b) => b.chatN - a.chatN || b.chatLast - a.chatLast)
+          .slice(0, lim)
+          .map((u) => ({
+            uid: u.uid,
+            nn: u.nn,
+            n: u.chatN,
+            rooms: u.chatRooms,
+            first: u.chatFirst,
+            last: u.chatLast,
+            level: u.chatLevel,
+          }));
+      } catch (err) {
+        console.error('[用户索引] 发言榜回退全表查询：' + err.message);
+      }
+    }
     const where = ["kind = 'chat'"];
     const args = [];
     if (rid) {
@@ -1333,7 +1354,7 @@ class Store {
          FROM messages WHERE ${where.join(' AND ')}
          GROUP BY uid ORDER BY n DESC, last DESC LIMIT ?`
       )
-      .all(...args, Math.min(Number(limit) || 20, 100))
+      .all(...args, lim)
       .map((r) => ({
         uid: r.uid,
         nn: r.nn,
@@ -1350,11 +1371,11 @@ class Store {
    * +1 次数 = 同一种说法的条数 − 1（第一条是首发，其余都是跟发）。
    * 按 stem 聚合，所以「哈哈哈」和「哈哈哈哈哈」算同一条；每行给出最典型的写法。
    */
-  topPlusOne({ rid, from, to, limit = 20 } = {}) {
+  topPlusOne({ rid, from, to, limit = 20, cache = true, fresh = false } = {}) {
     // 复用 topPhrases：它用窗口函数一次就把每组的最长原文取出来。
     // 早先这里是「先聚合、再对每个组各查一次最长样本」，而那个 WHERE 是表达式、
     // 用不上索引，100 条榜要跑 100 次全表扫描（实测 2.6 秒）。
-    return this.topPhrases({ rid, from, to, limit, min: 2 }).map((r) => ({
+    return this.topPhrases({ rid, from, to, limit, min: 2, cache, fresh }).map((r) => ({
       ...r,
       plusOne: Number(r.n) - 1,
     }));
@@ -1439,7 +1460,12 @@ class Store {
       .all(...args, lim);
   }
 
-  topPhrases({ rid, from, to, limit = 50, min = 2 } = {}) {
+  _cachePhrases(key, at, rows) {
+    if (this._phraseCache.size > 100) this._phraseCache.clear();
+    this._phraseCache.set(key, { at, rows });
+  }
+
+  topPhrases({ rid, from, to, limit = 50, min = 2, cache = true, fresh = false } = {}) {
     const where = ["kind = 'chat'"];
     const args = [];
     if (rid) {
@@ -1456,6 +1482,13 @@ class Store {
     }
     const w = where.join(' AND ');
     const lim = Math.min(Math.max(Number(limit) || 50, 1), 500);
+    const minV = Math.max(Number(min) || 1, 1);
+    const key = `${rid || 0}|${from == null ? 'n' : Number(from)}|${to == null ? 'n' : Number(to)}|${lim}|${minV}`;
+    const now = Date.now();
+    if (cache && !fresh) {
+      const hit = this._phraseCache.get(key);
+      if (hit && now - hit.at < 60000) return hit.rows.map((r) => ({ ...r }));
+    }
     const groups = this.db
       .prepare(
         `SELECT COALESCE(NULLIF(stem, ''), txt) AS g,
@@ -1465,8 +1498,11 @@ class Store {
           GROUP BY g HAVING n >= ?
           ORDER BY n DESC, users DESC LIMIT ?`
       )
-      .all(...args, Math.max(Number(min) || 1, 1), lim);
-    if (!groups.length) return [];
+      .all(...args, minV, lim);
+    if (!groups.length) {
+      if (cache) this._cachePhrases(key, now, []);
+      return [];
+    }
 
     // 每组取一版"最长原文"当展示样本：一条查询用窗口函数拿，避免 N+1
     const marks = groups.map(() => '?').join(',');
@@ -1484,7 +1520,7 @@ class Store {
       .all(...args, ...groups.map((g) => g.g));
     const sampleOf = new Map(rows.map((r) => [r.g, r.txt]));
 
-    return groups.map((r) => {
+    const out = groups.map((r) => {
       const sample = sampleOf.get(r.g) || r.g;
       return {
         phrase: r.g,
@@ -1497,6 +1533,8 @@ class Store {
         disp: stripAffixes(stripMention(sample)) || sample,
       };
     });
+    if (cache) this._cachePhrases(key, now, out);
+    return out;
   }
 
   /** 指定房间/时间段的聊天原文，供词频统计用（新的在前） */
@@ -1877,7 +1915,13 @@ class Store {
   _buildUserIndex() {
     const rows = this.db
       .prepare(
-        `SELECT uid, nn, COUNT(*) AS n, MAX(cst) AS last, COUNT(DISTINCT rid) AS rooms
+        `SELECT uid, MAX(nn) AS nn,
+                COUNT(*) AS n, MAX(cst) AS last, COUNT(DISTINCT rid) AS rooms,
+                MIN(CASE WHEN kind = 'chat' THEN cst END) AS chat_first,
+                MAX(CASE WHEN kind = 'chat' THEN cst END) AS chat_last,
+                SUM(CASE WHEN kind = 'chat' THEN 1 ELSE 0 END) AS chat_n,
+                COUNT(DISTINCT CASE WHEN kind = 'chat' THEN rid END) AS chat_rooms,
+                MAX(CASE WHEN kind = 'chat' THEN level END) AS chat_level
          FROM messages WHERE uid != '' GROUP BY uid ORDER BY n DESC`
       )
       .all();
@@ -1887,6 +1931,11 @@ class Store {
       n: Number(r.n) || 0,
       last: Number(r.last) || 0,
       rooms: Number(r.rooms) || 0,
+      chatN: Number(r.chat_n) || 0,
+      chatFirst: Number(r.chat_first) || 0,
+      chatLast: Number(r.chat_last) || 0,
+      chatRooms: Number(r.chat_rooms) || 0,
+      chatLevel: Number(r.chat_level) || 0,
     }));
   }
 
@@ -1894,6 +1943,10 @@ class Store {
    * 预热/刷新用户索引。索引本身要全表聚合一次（约 3 秒），所以放在启动后做；
    * 5 分钟内直接复用，过期时先返回旧索引、后台再刷新。
    */
+  userIndexAsOf() {
+    return this._userIndex ? this._userIndexAt : 0;
+  }
+
   warmUserIndex({ force = false } = {}) {
     const ttl = 5 * 60 * 1000;
     if (!force && this._userIndex && Date.now() - this._userIndexAt < ttl) {
@@ -1924,7 +1977,13 @@ class Store {
           (u) => u.uid === raw || u.nn.toLowerCase().includes(q)
         )
       : this._userIndex;
-    return rows.slice(0, limit).map((u) => ({ ...u }));
+    return rows.slice(0, limit).map((u) => ({
+      uid: u.uid,
+      nn: u.nn,
+      n: u.n,
+      last: u.last,
+      rooms: u.rooms,
+    }));
   }
 
   /** 昵称或 uid 模糊查找用户；q 为空时按发言量列出活跃用户 */

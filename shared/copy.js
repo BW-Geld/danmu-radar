@@ -54,18 +54,20 @@
 
     /** 检索结果展开：首发 / 谁在发 */
     DETAIL: {
-      title: '看谁在发、本库最早是谁',
+      title: '看谁在发、本房间最早是谁',
       expand: '展开',
       collapse: '收起',
-      originLoading: '本库最早：查询中…',
-      originEmpty: '本库最早：本地没有记录',
-      originFailed: '本库最早：加载失败',
+      originLoading: '本房间最早：查询中…',
+      originEmpty: '本房间最早：本地没有记录',
+      originFailed: '本房间最早：加载失败',
       sendersLoading: '谁在发：加载中…',
       sendersEmpty: '谁在发：本地没有记录',
       sendersFailed: '谁在发：加载失败',
       sendersTitle: '谁在发（{n} 人）：',
-      originWho: '本库最早：{who} · ',
+      originWho: '本房间最早：{who} · ',
       originStats: '共 {total} 条 / {users} 人 · 其中被 +1 {plusOne} 次 · 弹幕潮 {floods} 次',
+      sampleFrom: '样本取自 {who}',
+      firstInRoom: '本房间最早 {date} {time}',
     },
 
     /** 收藏夹：排序与 +1 口径 */
