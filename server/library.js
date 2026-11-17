@@ -100,7 +100,7 @@ function tempPath(storePath, tag) {
  * @param {import('./db').Store} store
  * @param {{rid?:number, from?:number, to?:number, anon?:boolean, name?:string}} opts
  */
-function exportLibrary(store, opts = {}) {
+async function exportLibrary(store, opts = {}) {
   const rid = Number(opts.rid) || 0;
   const from = Number(opts.from) || 0;
   const to = Number(opts.to) || 0;
@@ -131,16 +131,30 @@ function exportLibrary(store, opts = {}) {
   const uidExpr = anon ? '0' : 'uid';
   const nnExpr = anon ? `'匿名'` : 'nn';
 
-  db.exec('BEGIN IMMEDIATE');
-  db.prepare(`
+  const insert = db.prepare(`
     INSERT INTO messages(${MSG_COLS.join(',')})
     SELECT rid, room_name, ${uidExpr}, ${nnExpr}, txt, ntxt, cst, level,
            bnn, bl, brid, kind, gfid, gfcnt, 'import', ext, hkey, topic, stem
       FROM src.messages
-     WHERE ${cond}
+     WHERE ${cond} AND id > ? AND id <= ?
      ORDER BY cst ASC
-  `).run(...args);
-  db.exec('COMMIT');
+  `);
+  const pick = db.prepare(`SELECT id FROM src.messages WHERE ${cond} AND id > ? ORDER BY id LIMIT 5000`);
+  for (let last = 0; ; ) {
+    const ids = pick.all(...args, last);
+    if (!ids.length) break;
+    const end = ids[ids.length - 1].id;
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      insert.run(...args, last, end);
+      db.exec('COMMIT');
+    } catch (err) {
+      try { db.exec('ROLLBACK'); } catch { /* ignore */ }
+      throw err;
+    }
+    last = end;
+    await new Promise((r) => setImmediate(r));
+  }
 
   // rooms：只带库包里出现过的房间
   db.exec(`

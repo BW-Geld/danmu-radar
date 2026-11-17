@@ -145,7 +145,14 @@ loadUserLexicon();
 let RETENTION_DAYS = Number(process.env.DANMU_RETENTION || store.metaGet('retentionDays') || 90);
 if (!Number.isFinite(RETENTION_DAYS) || RETENTION_DAYS < 0) RETENTION_DAYS = 90;
 
+let pruneBusy = false;
 async function autoPrune() {
+  if (pruneBusy) {
+    console.warn('[维护] 自动清理跳过：上一轮未完成');
+    return;
+  }
+  pruneBusy = true;
+  const startedAt = Date.now();
   try {
     if (RETENTION_DAYS <= 0) {
       // 永久保留：仍然记一次检查时间，界面上能看出定时器是活的
@@ -157,6 +164,10 @@ async function autoPrune() {
     if (removed > 0) console.log(`[维护] 自动清理 ${removed} 条超过 ${RETENTION_DAYS} 天的弹幕`);
   } catch (err) {
     console.warn(`[维护] 自动清理失败：${err.message}`);
+  } finally {
+    pruneBusy = false;
+    const ms = Date.now() - startedAt;
+    if (ms >= 1000) console.log(`[维护] 自动清理耗时 ${ms}ms`);
   }
 }
 
@@ -199,7 +210,14 @@ setTimeout(autoPrune, 60 * 1000).unref();
 setInterval(autoPrune, 12 * 3600 * 1000).unref();
 
 /** 回填 topic / stem（老库一次性），再定时重建弹幕潮事件 */
+let backfillBusy = false;
 function backfillDerived() {
+  if (backfillBusy) {
+    console.warn('[维护] 回填跳过：上一轮未完成');
+    return;
+  }
+  backfillBusy = true;
+  const startedAt = Date.now();
   try {
     let total = 0;
     for (;;) {
@@ -211,15 +229,30 @@ function backfillDerived() {
     store.metaSet('topic_v1', String(Date.now()));
   } catch (err) {
     console.warn(`[维护] 回填失败：${err.message}`);
+  } finally {
+    backfillBusy = false;
+    const ms = Date.now() - startedAt;
+    if (ms >= 1000) console.log(`[维护] 回填耗时 ${ms}ms`);
   }
 }
 
+let floodBusy = false;
 function autoFloods() {
+  if (floodBusy) {
+    console.warn('[维护] 弹幕潮重建跳过：上一轮未完成');
+    return;
+  }
+  floodBusy = true;
+  const startedAt = Date.now();
   try {
     const r = store.rebuildFloods({ since: Date.now() - 20 * 60000 });
     if (r.events) console.log(`[维护] 弹幕潮事件 ${r.events} 个（候选桶 ${r.candidates}）`);
   } catch (err) {
     console.warn(`[维护] 弹幕潮重建失败：${err.message}`);
+  } finally {
+    floodBusy = false;
+    const ms = Date.now() - startedAt;
+    if (ms >= 1000) console.log(`[维护] 弹幕潮重建耗时 ${ms}ms`);
   }
 }
 
@@ -265,25 +298,38 @@ async function pullHighlights(rid, { final = false } = {}) {
 }
 
 /** 后台巡检：在播的定期拉；刚下播的补拉一次并标记收尾 */
+let highlightsBusy = false;
 async function highlightsSweep() {
-  for (const room of roomList()) {
-    const rid = Number(room.rid);
-    if (!rid) continue;
-    let live = 0;
-    try {
-      const info = await douyu.fetchRoomInfo(rid);
-      live = Number(info && info.room ? info.room.show_status : 0) === 1 ? 1 : 0;
-    } catch {
-      continue;
+  if (highlightsBusy) {
+    console.warn('[维护] 看点巡检跳过：上一轮未完成');
+    return;
+  }
+  highlightsBusy = true;
+  const startedAt = Date.now();
+  try {
+    for (const room of roomList()) {
+      const rid = Number(room.rid);
+      if (!rid) continue;
+      let live = 0;
+      try {
+        const info = await douyu.fetchRoomInfo(rid);
+        live = Number(info && info.room ? info.room.show_status : 0) === 1 ? 1 : 0;
+      } catch {
+        continue;
+      }
+      const before = hlLive.get(rid);
+      hlLive.set(rid, live);
+      try {
+        if (live) await pullHighlights(rid);
+        else if (before === 1) await pullHighlights(rid, { final: true });
+      } catch {
+        /* 网络抖动忽略，下一轮再来 */
+      }
     }
-    const before = hlLive.get(rid);
-    hlLive.set(rid, live);
-    try {
-      if (live) await pullHighlights(rid);
-      else if (before === 1) await pullHighlights(rid, { final: true });
-    } catch {
-      /* 网络抖动忽略，下一轮再来 */
-    }
+  } finally {
+    highlightsBusy = false;
+    const ms = Date.now() - startedAt;
+    if (ms >= 5000) console.log(`[维护] 看点巡检耗时 ${ms}ms`);
   }
 }
 // 关窗口即停采集：只要界面连过、又全部断开，就开始倒计时
@@ -996,7 +1042,14 @@ async function handleApi(req, res, url) {
   if (p === '/users' && req.method === 'GET') {
     const kw = (q.get('q') || '').trim();
     if (kw.length > 100) return json(res, 400, { ok: false, error: '查询太长（最多 100 字）' });
-    return json(res, 200, { ok: true, users: store.findUsers(kw, 20) });
+    const rawLimit = q.get('limit');
+    const asked = rawLimit == null || rawLimit === '' ? NaN : Number(rawLimit);
+    // limit=0 表示返回全部匹配（只在有关键词时生效；空查询仍只给默认 15 个）
+    let lim = Number.isFinite(asked) ? Math.trunc(asked) : 15;
+    if (lim < 0) lim = 15;
+    if (lim === 0 && !kw) lim = 15;
+    if (lim > 1000) lim = 1000;
+    return json(res, 200, { ok: true, users: store.findUsers(kw, lim) });
   }
 
   const userMatch = p.match(/^\/users\/([^/]+)$/);
@@ -1153,7 +1206,7 @@ async function handleApi(req, res, url) {
   // 导出：直接下载一个 .db 库包（默认匿名）
   if (p === '/library/export' && req.method === 'GET') {
     const anon = q.get('anon') !== '0';
-    const out = library.exportLibrary(store, {
+    const out = await library.exportLibrary(store, {
       rid: Number(q.get('rid')) || 0,
       from: Number(q.get('from')) || 0,
       to: Number(q.get('to')) || 0,

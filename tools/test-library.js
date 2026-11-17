@@ -70,7 +70,7 @@ function seed(store) {
   ok(inserted === 201, '源库写入 201 条（同毫秒同内容已合并 1 条）', `实际 ${inserted}`);
 
   // 1. 匿名导出
-  const anonPack = exportLibrary(srcStore, { anon: true });
+  const anonPack = await exportLibrary(srcStore, { anon: true });
   const pack = new DatabaseSync(anonPack.file, { readOnly: true });
   const meta = Object.fromEntries(pack.prepare('SELECT k, v FROM lib_meta').all().map((r) => [r.k, r.v]));
   const uids = pack.prepare('SELECT COUNT(*) AS c FROM messages WHERE uid != 0').get().c;
@@ -94,7 +94,7 @@ function seed(store) {
   ok(r2.inserted === 0 && r2.dupes === 201, '重复导入：全部算重复', `新增 ${r2.inserted} / 重复 ${r2.dupes}`);
 
   // 4. 实名包导进已有匿名包的库：同一条弹幕不能翻倍
-  const fullPack = exportLibrary(srcStore, { anon: false });
+  const fullPack = await exportLibrary(srcStore, { anon: false });
   const r3 = await importLibrary(dstStore, fullPack.file);
   ok(r3.inserted === 0 && r3.dupes === 201, '实名包 × 匿名包：指纹一致，一条都不重复入库', `新增 ${r3.inserted} / 重复 ${r3.dupes}`);
 
@@ -106,14 +106,14 @@ function seed(store) {
   ok(r4.inserted === 201 && r5.inserted === 0, '先实名后匿名：也不翻倍', `实名 ${r4.inserted} / 匿名 ${r5.inserted}`);
 
   // 6. 按房间 / 按时间切片
-  const part = exportLibrary(srcStore, { rid: 1002, anon: true });
+  const part = await exportLibrary(srcStore, { rid: 1002, anon: true });
   const partDb = new DatabaseSync(part.file, { readOnly: true });
   const roomsInPart = partDb.prepare('SELECT DISTINCT rid FROM messages').all().map((r) => r.rid);
   partDb.close();
   ok(part.rows === 80 && roomsInPart.length === 1 && roomsInPart[0] === 1002, '按房间导出只含该房间', `${part.rows} 条`);
 
   const base = Date.UTC(2026, 10, 4, 12, 0, 0);
-  const slice = exportLibrary(srcStore, { from: base + 50000, to: base + 80000, anon: true });
+  const slice = await exportLibrary(srcStore, { from: base + 50000, to: base + 80000, anon: true });
   ok(slice.rows > 0 && slice.rows < 201, '按时间导出是子集', `${slice.rows} 条`);
 
   // 7. 坏文件要拒绝

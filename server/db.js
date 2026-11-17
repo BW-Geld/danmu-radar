@@ -5,6 +5,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { Worker } = require('node:worker_threads');
 const { DatabaseSync } = require('node:sqlite');
 const { normalize, stem, keyOf, stemOf, stripMention, stripAffixes, setAffixes, getAffixes } = require('./text');
 const { classify } = require('./topics');
@@ -1911,20 +1912,7 @@ class Store {
     return row ? Number(row.n) : 0;
   }
 
-  /** 建一次用户聚合索引；findUsers 之后在内存里筛选，不再每次扫 30 万条。 */
-  _buildUserIndex() {
-    const rows = this.db
-      .prepare(
-        `SELECT uid, MAX(nn) AS nn,
-                COUNT(*) AS n, MAX(cst) AS last, COUNT(DISTINCT rid) AS rooms,
-                MIN(CASE WHEN kind = 'chat' THEN cst END) AS chat_first,
-                MAX(CASE WHEN kind = 'chat' THEN cst END) AS chat_last,
-                SUM(CASE WHEN kind = 'chat' THEN 1 ELSE 0 END) AS chat_n,
-                COUNT(DISTINCT CASE WHEN kind = 'chat' THEN rid END) AS chat_rooms,
-                MAX(CASE WHEN kind = 'chat' THEN level END) AS chat_level
-         FROM messages WHERE uid != '' GROUP BY uid ORDER BY n DESC`
-      )
-      .all();
+  _mapUserIndexRows(rows) {
     return rows.map((r) => ({
       uid: String(r.uid),
       nn: r.nn == null ? '' : String(r.nn),
@@ -1939,6 +1927,56 @@ class Store {
     }));
   }
 
+  /** 建一次用户聚合索引；findUsers 之后在内存里筛选，不再每次扫 30 万条。 */
+  _buildUserIndex() {
+    const rows = this.db
+      .prepare(
+        `SELECT m.uid,
+                (SELECT nn FROM messages m2
+                  WHERE m2.uid = m.uid AND m2.kind = 'chat' AND m2.nn != ''
+                  ORDER BY m2.cst DESC, m2.id DESC LIMIT 1) AS nn,
+                COUNT(*) AS n, MAX(m.cst) AS last, COUNT(DISTINCT m.rid) AS rooms,
+                MIN(CASE WHEN m.kind = 'chat' THEN m.cst END) AS chat_first,
+                MAX(CASE WHEN m.kind = 'chat' THEN m.cst END) AS chat_last,
+                SUM(CASE WHEN m.kind = 'chat' THEN 1 ELSE 0 END) AS chat_n,
+                COUNT(DISTINCT CASE WHEN m.kind = 'chat' THEN m.rid END) AS chat_rooms,
+                MAX(CASE WHEN m.kind = 'chat' THEN m.level END) AS chat_level
+         FROM messages m WHERE m.uid != '' GROUP BY m.uid ORDER BY n DESC`
+      )
+      .all();
+    return this._mapUserIndexRows(rows);
+  }
+
+  /**
+   * 在 worker 里建用户索引，主线程只负责替换结果。
+   * 这样每 5 分钟重建一次时，采集/HTTP 不会被 3 秒的同步全表聚合卡住。
+   */
+  _buildUserIndexAsync() {
+    if (!this.path || this.path === ':memory:') {
+      return Promise.resolve(this._buildUserIndex());
+    }
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const worker = new Worker(path.join(__dirname, 'user-index-worker.js'), {
+        workerData: { dbPath: this.path },
+      });
+      const finish = (err, rows) => {
+        if (settled) return;
+        settled = true;
+        if (err) reject(err);
+        else resolve(this._mapUserIndexRows(rows));
+      };
+      worker.once('message', (msg) => {
+        if (msg && msg.ok) finish(null, msg.rows || []);
+        else finish(new Error((msg && msg.error) || 'worker 未返回结果'));
+      });
+      worker.once('error', (err) => finish(err));
+      worker.once('exit', (code) => {
+        if (!settled && code !== 0) finish(new Error('worker 退出码 ' + code));
+      });
+    });
+  }
+
   /**
    * 预热/刷新用户索引。索引本身要全表聚合一次（约 3 秒），所以放在启动后做；
    * 5 分钟内直接复用，过期时先返回旧索引、后台再刷新。
@@ -1947,49 +1985,97 @@ class Store {
     return this._userIndex ? this._userIndexAt : 0;
   }
 
+  /** 按 UID 取最近一次使用的昵称；昵称只是显示值，身份始终是 UID。 */
+  latestName(uid) {
+    const r = this.db
+      .prepare(
+        `SELECT nn FROM messages
+          WHERE uid = ? AND kind = 'chat' AND nn != ''
+          ORDER BY cst DESC, id DESC LIMIT 1`
+      )
+      .get(String(uid));
+    return r && r.nn != null ? String(r.nn) : '';
+  }
+
+  /** 某个 UID 用过的昵称及各自时间范围；按最近使用倒序。 */
+  userNames(uid, limit = 12) {
+    const lim = Math.min(50, Math.max(1, Number(limit) || 12));
+    return this.db
+      .prepare(
+        `SELECT nn, COUNT(*) AS n, MIN(cst) AS first, MAX(cst) AS last
+           FROM messages
+          WHERE uid = ? AND kind = 'chat' AND nn != ''
+          GROUP BY nn
+          ORDER BY last DESC, n DESC
+          LIMIT ?`
+      )
+      .all(String(uid), lim);
+  }
+
   warmUserIndex({ force = false } = {}) {
     const ttl = 5 * 60 * 1000;
     if (!force && this._userIndex && Date.now() - this._userIndexAt < ttl) {
       return Promise.resolve(this._userIndex);
     }
     if (this._userIndexPromise) return this._userIndexPromise;
-    this._userIndexPromise = new Promise((resolve) => {
-      setImmediate(() => {
+    this._userIndexPromise = this._buildUserIndexAsync()
+      .then((rows) => {
+        this._userIndex = rows;
+        this._userIndexAt = Date.now();
+        return rows;
+      })
+      .catch((err) => {
+        // worker 失败时退回主线程同步建一次；仍失败就继续用旧索引。
+        console.error('[用户索引] worker 构建失败：' + err.message);
         try {
-          this._userIndex = this._buildUserIndex();
+          const rows = this._buildUserIndex();
+          this._userIndex = rows;
           this._userIndexAt = Date.now();
-          resolve(this._userIndex);
-        } catch (err) {
-          console.error('[用户索引] 构建失败：' + err.message);
-          resolve(this._userIndex || []);
-        } finally {
-          this._userIndexPromise = null;
+          return rows;
+        } catch (err2) {
+          console.error('[用户索引] 同步兜底失败：' + err2.message);
+          return this._userIndex || [];
         }
+      })
+      .finally(() => {
+        this._userIndexPromise = null;
       });
-    });
     return this._userIndexPromise;
   }
 
   _filterUsers(raw, limit) {
     const q = raw.toLowerCase();
-    const rows = raw
+    let rows = raw
       ? this._userIndex.filter(
           (u) => u.uid === raw || u.nn.toLowerCase().includes(q)
         )
       : this._userIndex;
-    return rows.slice(0, limit).map((u) => ({
+    if (raw) {
+      // 完全同名/UID 优先，再按发言量；列表要能完整滚动，不能截断候选。
+      const exact = [];
+      const rest = [];
+      for (const u of rows) {
+        if (u.uid === raw || (u.nn || '').toLowerCase() === q) exact.push(u);
+        else rest.push(u);
+      }
+      rows = exact.concat(rest);
+    }
+    const out = limit > 0 ? rows.slice(0, limit) : rows;
+    return out.map((u) => ({
       uid: u.uid,
       nn: u.nn,
       n: u.n,
       last: u.last,
       rooms: u.rooms,
+      level: Number(u.chatLevel) || 0,
     }));
   }
 
   /** 昵称或 uid 模糊查找用户；q 为空时按发言量列出活跃用户 */
   findUsers(q, limit = 20) {
     const raw = String(q || '').trim();
-    const lim = Number(limit) || 20;
+    const asked = Number(limit);
+    const lim = Number.isFinite(asked) ? Math.trunc(asked) : 20;
     const ttl = 5 * 60 * 1000;
     if (this._userIndex && Date.now() - this._userIndexAt < ttl) {
       return this._filterUsers(raw, lim);
@@ -2007,13 +2093,14 @@ class Store {
       return this._filterUsers(raw, lim);
     }
     // 索引建不起来时的兜底：保持旧行为，至少还能查
+    const sqlLimit = lim > 0 ? lim : -1;
     if (!raw) {
       return this.db
         .prepare(
           `SELECT uid, nn, COUNT(*) AS n, MAX(cst) AS last, COUNT(DISTINCT rid) AS rooms
            FROM messages WHERE uid != '' GROUP BY uid ORDER BY n DESC LIMIT ?`
         )
-        .all(lim);
+        .all(sqlLimit);
     }
     return this.db
       .prepare(
@@ -2022,7 +2109,7 @@ class Store {
          WHERE (uid = ? OR nn LIKE ?)
          GROUP BY uid, nn ORDER BY n DESC LIMIT ?`
       )
-      .all(raw, `%${raw}%`, lim);
+      .all(raw, `%${raw}%`, sqlLimit);
   }
 
   stats({ fresh = false } = {}) {

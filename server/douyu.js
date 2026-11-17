@@ -209,6 +209,7 @@ class DanmuClient extends EventEmitter {
           });
           break;
         }
+        // uenter / dgb / sdgb：生产端当前无消费者，仅供 tools/selftest.js 诊断
         case 'uenter': {
           this.emit('event', {
             kind: 'enter',

@@ -491,12 +491,8 @@ async function loadRecent() {
 }
 
 function msgNode(m) {
-  const row = h('div', 'msg' + (m.kind === 'enter' ? ' enter' : ''));
+  const row = h('div', 'msg');
   row.append(h('span', 't', fmtTime(m.cst)));
-  if (m.kind === 'enter') {
-    row.append(h('span', 'x', `${m.nn || m.uid} 进入直播间`));
-    return row;
-  }
   if (m.level) row.append(h('span', 'lv', `Lv${m.level}`));
   const nn = h('span', 'n', m.nn || m.uid);
   nn.title = `${m.nn || ''}（${m.uid}）`;
@@ -1697,35 +1693,113 @@ $('#u-btn').addEventListener('click', () => runProfile($('#uid').value.trim()));
 $('#uid').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') runProfile($('#uid').value.trim());
 });
-
-/**
- * 输入框既收 UID 也收昵称。纯数字直接当 UID；否则先按昵称查一遍，
- * 优先「完全同名」的，其次发言最多的那个。
- */
-async function resolveUserInput(raw) {
-  const input = String(raw || '').trim();
-  if (!input) throw new Error('请输入 UID 或昵称');
-  if (/^\d+$/.test(input)) return input;
-
-  const d = await api('/api/users?q=' + encodeURIComponent(input));
-  const list = d.users || [];
-  if (!list.length) throw new Error(`本地没有昵称包含「${input}」的用户`);
-
-  const exact = list.find((u) => u.nn === input);
-  const pick = exact || list[0];
-  if (!exact && list.length > 1) {
-    toast(`「${input}」对上 ${list.length} 个用户，取发言最多的「${pick.nn || pick.uid}」（${fmtNum(pick.n)} 条）`);
-  }
-  return String(pick.uid);
-}
+$('#uid').addEventListener('input', hideUserCandidates);
 
 let profileSeq = 0;
 
-async function runProfile(uid) {
-  if (!uid) {
+/**
+ * 输入框既收 UID 也收昵称。纯数字直接当 UID；昵称先查候选：
+ * 只有一个 / 完全同名唯一 → 直接进画像；多个 → 列 15 个让用户选。
+ */
+function hideUserCandidates() {
+  const box = $('#u-candidates');
+  if (!box) return;
+  box.hidden = true;
+  box.textContent = '';
+}
+
+function renderUserCandidates(list, input) {
+  const box = $('#u-candidates');
+  box.textContent = '';
+  box.hidden = false;
+
+  box.append(h('div', 'u-head', `匹配到 ${list.length} 个用户，点击用户名查看详情`));
+
+  const ul = h('ul', 'board');
+  list.forEach((u, i) => {
+    const li = h('li', 'board-row');
+    li.append(h('span', 'rank', String(i + 1)));
+
+    const name = h('button', 'board-name', u.nn || u.uid);
+    name.title = `UID ${u.uid}`;
+    if (u.nn === input) name.append(h('span', 'u-exact', '完全匹配'));
+    li.append(name);
+
+    const chip = followChip(u);
+    li.append(chip);
+
+    const meta = h('span', 'board-meta');
+    meta.append(h('b', null, fmtNum(u.n)), document.createTextNode(' 条'));
+    if (u.level) meta.append(document.createTextNode(` · Lv${u.level}`));
+    meta.append(document.createTextNode(` · 最后 ${ago(u.last)}`));
+    li.append(meta);
+
+    li.addEventListener('click', (ev) => {
+      if (ev.target.closest('.follow-chip')) return;
+      $('#uid').value = u.uid;
+      hideUserCandidates();
+      showProfile(u.uid);
+    });
+    ul.append(li);
+  });
+  box.append(ul);
+  // 固定只露出 13 行；剩余在容器内滚动。用实际行高计算，避免字体/缩放下露出半行。
+  const firstRow = ul.querySelector('.board-row');
+  const rowH = firstRow ? firstRow.getBoundingClientRect().height : 0;
+  if (rowH > 0) ul.style.maxHeight = `${rowH * 13}px`;
+}
+
+async function runProfile(raw) {
+  const input = String(raw || '').trim();
+  if (!input) {
     toast('请输入 UID 或昵称');
     return;
   }
+  hideUserCandidates();
+  if (/^\d+$/.test(input)) {
+    await showProfile(input);
+    return;
+  }
+
+  const seq = ++profileSeq;
+  const btn = $('#u-btn');
+  btn.disabled = true;
+  btn.textContent = '查询中…';
+  try {
+    const d = await api('/api/users?q=' + encodeURIComponent(input) + '&limit=0');
+    if (seq !== profileSeq) return;
+    const list = d.users || [];
+    if (!list.length) {
+      renderProfileError(`本地没有昵称包含「${input}」的用户`);
+      return;
+    }
+    const exact = list.filter((u) => u.nn === input);
+    if (list.length === 1) {
+      await showProfile(list[0].uid);
+      return;
+    }
+    if (exact.length === 1) {
+      await showProfile(exact[0].uid);
+      return;
+    }
+    renderUserCandidates(list, input);
+  } catch (err) {
+    if (seq === profileSeq) renderProfileError(err.message);
+  } finally {
+    if (seq === profileSeq) {
+      btn.disabled = false;
+      btn.textContent = '分析';
+    }
+  }
+}
+
+async function showProfile(uid) {
+  const id = String(uid || '').trim();
+  if (!id) {
+    toast('请输入 UID 或昵称');
+    return;
+  }
+  hideUserCandidates();
   const seq = ++profileSeq;
   const btn = $('#u-btn');
   btn.disabled = true;
@@ -1734,7 +1808,7 @@ async function runProfile(uid) {
   box.textContent = '';
   box.append(loadingBlock('正在分析…'));
   try {
-    const d = await api('/api/users/' + encodeURIComponent(await resolveUserInput(uid)));
+    const d = await api('/api/users/' + encodeURIComponent(id));
     if (seq !== profileSeq) return;
     renderProfile(d);
   } catch (err) {
@@ -1884,10 +1958,25 @@ function renderProfile(d) {
   curProfile = d;
 
   const head = h('div', 'pf-head');
-  const av = h('div', 'avatar', (d.names[0] || d.uid).slice(0, 1).toUpperCase());
+  const mainName = d.currentName || (d.names && d.names[0]) || d.uid;
+  const av = h('div', 'avatar', mainName.slice(0, 1).toUpperCase());
   const meta = h('div');
-  meta.append(h('div', 'names', d.names.join(' / ') || d.uid));
+  meta.append(h('div', 'names', mainName));
   meta.append(h('div', 'ids', `UID ${d.uid} · 采集覆盖 ${d.range.spanDays} 天 / ${d.range.days} 个活跃日 · 共 ${fmtNum(d.total)} 条`));
+  const history = (d.nameHistory || []).filter((x) => x.nn && x.nn !== mainName);
+  if (history.length) {
+    const aka = h('div', 'aka');
+    aka.append(h('b', null, '曾用名：'));
+    history.slice(0, 5).forEach((x, i) => {
+      if (i) aka.append(document.createTextNode(' · '));
+      const range = fmtDate(x.first) === fmtDate(x.last)
+        ? fmtDate(x.last)
+        : `${fmtDate(x.first)} ~ ${fmtDate(x.last)}`;
+      aka.append(document.createTextNode(`${x.nn}（${range}，${fmtNum(x.n)} 条）`));
+    });
+    if (history.length > 5) aka.append(document.createTextNode(` 等 ${history.length} 个`));
+    meta.append(aka);
+  }
   if (d.sources && (d.sources.vod > 0 || d.sources.import > 0)) {
     const bits = [`直播采集 ${fmtNum(d.sources.live)} 条`];
     if (d.sources.vod > 0) bits.push(`录播 ${fmtNum(d.sources.vod)} 条`);
@@ -2331,6 +2420,7 @@ async function loadSettings() {
 
 // ------------------------------------------------------------ 收藏夹
 const fav = { items: [], keys: new Set() };
+const favPending = new Set();
 
 // 收藏夹排序：只在前端重排，不额外请求；刷新页面回默认
 const favSort = { by: 'time', dir: 'desc' };
@@ -2438,18 +2528,22 @@ async function toggleFavorite(r) {
     // rid=0（排行榜/时间线的「全部房间」）会被后端补成真实房间，
     // 星标的 key 也必须跟着换，否则图标永远停在 ☆。
     const realRid = Number(d.rid ?? r.rid) || 0;
-    fav.items.unshift({
-      id: d.id,
-      rid: realRid,
-      stem: r.stem || r.txt,
-      txt: r.disp || r.txt,
-      room_name: r.room || '',
-      note: '',
-      created_at: Date.now(),
-      hits: r.n || 0,
-      users: r.users || 0,
-      plusOne: Math.max(0, (Number(r.n) || 0) - 1),
-    });
+    const stem = r.stem || r.txt;
+    const already = fav.items.some((f) => f.id === d.id || (Number(f.rid) === realRid && f.stem === stem));
+    if (!already) {
+      fav.items.unshift({
+        id: d.id,
+        rid: realRid,
+        stem,
+        txt: r.disp || r.txt,
+        room_name: r.room || '',
+        note: '',
+        created_at: Date.now(),
+        hits: r.n || 0,
+        users: r.users || 0,
+        plusOne: Math.max(0, (Number(r.n) || 0) - 1),
+      });
+    }
     if (realRid !== Number(r.rid)) {
       const nextKey = `${realRid}|${r.stem || r.txt}`;
       for (const b of document.querySelectorAll(`.fav[data-key="${CSS.escape(key)}"]`)) {
@@ -2494,13 +2588,17 @@ function favButton(r) {
   b.title = on ? '取消收藏' : '收藏这句';
   b.addEventListener('click', async (ev) => {
     ev.stopPropagation();
-    b.disabled = true;
+    if (favPending.has(key)) return;
+    const same = [...document.querySelectorAll(`.fav[data-key="${CSS.escape(key)}"]`)];
+    favPending.add(key);
+    same.forEach((x) => { x.disabled = true; });
     try {
       await toggleFavorite(r);
     } catch (err) {
       toast(err.message, true);
     } finally {
-      b.disabled = false;
+      favPending.delete(key);
+      same.forEach((x) => { x.disabled = false; });
     }
   });
   return b;
@@ -2537,7 +2635,7 @@ function renderFavorites() {
   for (const it of items) {
     const row = h('div', 'fav-item');
     const main = h('div', 'fav-main');
-    const title = h('button', 'fav-title', it.stem || it.txt);
+    const title = h('button', 'fav-title', it.txt || it.stem);
     title.title = '在检索里查这句';
     title.addEventListener('click', () => favSearch(it));
     main.append(title);
@@ -3041,6 +3139,7 @@ async function boot() {
 // ------------------------------------------------------------ 时间线
 
 const tl = { data: null, sel: null, drag: null };
+let tlRaf = 0;
 
 function fmtDur(mins) {
   const m = Math.max(1, Math.round(mins));
@@ -3062,6 +3161,20 @@ function tlCanvas() {
   const ctx = cv.getContext('2d');
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   return { cv, ctx, w, hgt };
+}
+
+function tlScheduleDraw() {
+  if (tlRaf) return;
+  tlRaf = requestAnimationFrame(() => {
+    tlRaf = 0;
+    tlDraw();
+    const r = tlSelRange();
+    if (r) {
+      $('#t-readout').textContent = `${fmtTime(r.from)} → ${fmtTime(r.to)} · ${fmtDur(
+        (r.to - r.from) / 60000
+      )} · ${fmtNum(tlSum(r.a, r.b))} 条`;
+    }
+  });
 }
 
 function tlDraw() {
@@ -3520,21 +3633,13 @@ function tlEdgeAt(ev) {
       tl.drag.moved = true;
       if (tl.drag.edge === 'a') tl.sel.a = i;
       else tl.sel.b = i;
-      tlDraw();
-      const r = tlSelRange();
-      if (r) {
-        $('#t-readout').textContent = `${fmtTime(r.from)} → ${fmtTime(r.to)} · ${fmtDur(
-          (r.to - r.from) / 60000
-        )} · ${fmtNum(tlSum(r.a, r.b))} 条`;
-      }
+      tlScheduleDraw();
       return;
     }
     if (tl.drag) {
       if (i !== tl.drag.start) tl.drag.moved = true;
       tl.sel = { a: tl.drag.start, b: i };
-      tlDraw();
-      const r = tlSelRange();
-      if (r) $('#t-readout').textContent = `${fmtTime(r.from)} → ${fmtTime(r.to)} · ${fmtDur((r.to - r.from) / 60000)} · ${fmtNum(tlSum(r.a, r.b))} 条`;
+      tlScheduleDraw();
       return;
     }
     cv.style.cursor = tlEdgeAt(ev) ? 'ew-resize' : 'crosshair';
