@@ -1950,7 +1950,7 @@ function renderProfile(d) {
     ['夜间(0-6点)', Math.round(d.stats.nightRatio * 100) + '%'],
     ['发言间隔变异', d.stats.intervalCv],
     ['去过的房间', d.stats.rooms + ' 个'],
-    ['送礼/事件', d.stats.gifts + ' 次'],
+    
   ];
   if (d.hostility && d.hostility.total) {
     const h0 = d.hostility;

@@ -23,7 +23,7 @@
       diversity: '话题多样性',
       aggression: '对立倾向',
       bot: '程序化倾向',
-      spend: '消费行为',
+      
     },
 
     LABEL: {
