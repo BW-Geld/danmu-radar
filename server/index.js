@@ -914,8 +914,7 @@ async function handleApi(req, res, url) {
     }
     // 没有独立窗口，但可能已经在浏览器标签里开着（标题含「弹幕雷达」）：把它叫出来就行，
     // 不要再启动一次浏览器——提权/普通权限混用时，再启动一次会弹 Windows 的「Edge 未响应」权限提示。
-    // 用户明确点「开浏览器窗口」时必须真的开一个，不能被「把已有窗口提到前台」吞掉
-    if (!opts.force && (await focusAnyWindow())) {
+    if (await focusAnyWindow()) {
       ensureTray();
       return json(res, 200, { ok: true, how: 'tab-focused' });
     }
