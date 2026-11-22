@@ -161,7 +161,10 @@ async function autoPrune() {
     }
     const removed = await store.prune(RETENTION_DAYS);
     store.metaSet('last_prune_at', String(Date.now()));
-    if (removed > 0) console.log(`[维护] 自动清理 ${removed} 条超过 ${RETENTION_DAYS} 天的弹幕`);
+    if (removed > 0) {
+      analysis.clearCaches();
+      console.log(`[维护] 自动清理 ${removed} 条超过 ${RETENTION_DAYS} 天的弹幕`);
+    }
   } catch (err) {
     console.warn(`[维护] 自动清理失败：${err.message}`);
   } finally {
@@ -945,10 +948,10 @@ async function handleApi(req, res, url) {
         /* ignore */
       }
     }
-    const ok = ensureTray();
+    const tray = ensureTray();
     // closedWindow 告诉前端：独立窗口已经被我们关掉了；false 说明用户是在浏览器标签里看的，
     // 那个标签页得他自己关（脚本没法保证 window.close() 生效）。
-    return json(res, 200, { ok: true, action: 'tray', tray: ok, closedWindow: hadAppWindow });
+    return json(res, 200, { ok: true, action: 'tray', tray: tray !== 'failed', closedWindow: hadAppWindow });
   }
 
   // 主动停止采集并退出（界面上的「停止并退出」按钮）
@@ -1055,7 +1058,7 @@ async function handleApi(req, res, url) {
   if (userMatch && req.method === 'GET') {
     const uid = decodeURIComponent(userMatch[1]).trim();
     if (!uid || uid.length > 128) return json(res, 400, { ok: false, error: 'UID 不合法' });
-    const result = analysis.profile(store, uid);
+    const result = analysis.profileCached(store, uid, { fresh: q.get('fresh') === '1' });
     if (result.ok) Object.assign(result, store.followState(uid));
     return json(res, result.ok ? 200 : 404, result);
   }
@@ -1152,6 +1155,7 @@ async function handleApi(req, res, url) {
     store.metaSet('retentionDays', String(days));
     RETENTION_DAYS = days;
     const removed = days > 0 ? await store.prune(days) : 0;
+    if (removed > 0) analysis.clearCaches();
     if (days === 0) console.log('[维护] 已改为永久保留，不再自动清理');
     return json(res, 200, { ok: true, removed, retentionDays: days });
   }
@@ -1251,6 +1255,7 @@ async function handleApi(req, res, url) {
         deferFloods: true,
       });
       store.invalidateStats();
+      analysis.clearCaches();
       broadcast('rooms', roomListFull());
       broadcast('stats', store.stats());
       json(res, 200, { ok: true, ...out });
@@ -1260,6 +1265,7 @@ async function handleApi(req, res, url) {
             broadcast('libprogress', { phase: 'recompute', step: 'floods' });
             const f = store.rebuildFloods({ since: out.from || 0 });
             store.invalidateStats();
+            analysis.clearCaches();
             broadcast('stats', store.stats());
             broadcast('libprogress', {
               phase: 'done',
@@ -1491,21 +1497,23 @@ function killTrayProcesses() {
 }
 
 function ensureTray() {
-  if (trayAlive()) return true;
+  // 返回 'already-alive' | 'starting' | 'spawned' | 'failed'。
+  // 调用方只有拿到 'spawned' 才能说「已重新拉起」，否则会把「本来还活着」误报成重启。
+  if (trayAlive()) return 'already-alive';
   // 刚拉过、pid 文件还没落盘的这段时间，直接当作已启动，避免重复拉
-  if (trayChild && !trayChild.killed) return true;
-  if (trayStartedAt && Date.now() - trayStartedAt < 10000) return true;
+  if (trayChild && !trayChild.killed) return 'starting';
+  if (trayStartedAt && Date.now() - trayStartedAt < 10000) return 'starting';
   // 走到这儿说明 pid 文件不可信（上次的服务被杀、托盘还在）。
   // 先把残留的托盘进程清干净再拉一个新的，否则会并排出现两个图标。
   killTrayProcesses();
   if (process.platform !== 'win32') {
     console.log('[托盘] 目前只在 Windows 上支持缩到托盘');
-    return false;
+    return 'failed';
   }
   const ps = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
   if (!fs.existsSync(ps)) {
     console.log('[托盘] 找不到 powershell.exe，无法缩到托盘');
-    return false;
+    return 'failed';
   }
   try {
     const { spawn } = require('node:child_process');
@@ -1528,7 +1536,8 @@ function ensureTray() {
     });
     // 托盘进程自己退出（脚本判定服务器没了、被杀、系统休眠）时必须清掉记录，
     // 否则 ensureTray() 会一直以为「还活着」，从此再也不拉起——图标就这么消失了。
-    p.on('exit', () => {
+    p.on('exit', (code, signal) => {
+      console.log(`[托盘] 托盘进程退出 pid=${p.pid} code=${code == null ? 'null' : code} signal=${signal || 'none'}`);
       if (trayChild === p) {
         trayChild = null;
         trayStartedAt = 0;
@@ -1537,11 +1546,12 @@ function ensureTray() {
     p.unref();
     trayChild = p;
     trayStartedAt = Date.now();
+    console.log(`[托盘] 已拉起新托盘进程 pid=${p.pid}`);
     console.log('[托盘] 托盘图标已就绪（双击回到界面，右键可退出）');
-    return true;
+    return 'spawned';
   } catch (err) {
     console.log(`[托盘] 启动失败：${err.message}`);
-    return false;
+    return 'failed';
   }
 }
 
@@ -2075,7 +2085,9 @@ function uiMonitor() {
   // 而这时候界面往往正开着（下面会因为 clients>0 提前 return），没人补。
   if (s.closeAction === 'tray' && !trayAlive() && Date.now() - lastTrayTry > 30000) {
     lastTrayTry = Date.now();
-    if (ensureTray()) console.log('[托盘] 图标不见了，已重新拉起');
+    const tray = ensureTray();
+    if (tray === 'spawned') console.log('[托盘] 图标不见了，已重新拉起');
+    else if (tray === 'failed') console.log('[托盘] 图标不见了，重新拉起失败');
   }
 
   if (clients.size > 0) {
@@ -2089,9 +2101,9 @@ function uiMonitor() {
     if (trayAlive()) return;
     if (Date.now() - lastTrayTry < 30000) return;
     lastTrayTry = Date.now();
-    const ok = ensureTray();
+    const tray = ensureTray();
     console.log(
-      ok
+      tray !== 'failed'
         ? '[界面] 界面已断开，已缩到系统托盘，采集继续（双击托盘图标回到界面）'
         : '[界面] 界面已断开，托盘没能启动（采集仍在继续）'
     );

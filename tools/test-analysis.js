@@ -167,6 +167,17 @@ check('节奏号被识别', agg.labels.some((l) => l.key === 'toxic'), agg.label
 check('攻击性评分偏高', agg.scores.aggression >= 35, `aggression=${agg.scores.aggression}`);
 check('标签带证据句', (agg.labels[0].evidence || []).length > 0, JSON.stringify(agg.labels[0].evidence[0] || null));
 
+// 画像缓存：命中同对象、fresh 绕过、清空后重算
+analysis.clearCaches();
+const cachedA = analysis.profileCached(store, '888888');
+const cachedB = analysis.profileCached(store, '888888');
+check('画像缓存命中返回同一对象', cachedA === cachedB);
+const freshA = analysis.profileCached(store, '888888', { fresh: true });
+check('fresh=1 绕过缓存', freshA !== cachedA);
+analysis.clearCaches();
+const afterClear = analysis.profileCached(store, '888888');
+check('清缓存后重新计算', afterClear !== cachedA);
+
 const nobody = analysis.profile(store, '424242');
 check('无记录用户有明确空态', nobody.ok === false && nobody.empty === true, nobody.error);
 

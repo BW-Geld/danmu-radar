@@ -14,6 +14,20 @@ $dataDir = Join-Path $PSScriptRoot '..\data'
 $pidFile = Join-Path $dataDir 'tray.pid'
 $errFile = Join-Path $dataDir 'tray-error.log'
 
+$script:probeFails = 0
+function Write-TrayLog([string]$msg) {
+  try {
+    if (Test-Path -LiteralPath $errFile) {
+      $fi = Get-Item -LiteralPath $errFile -ErrorAction SilentlyContinue
+      if ($fi -and $fi.Length -gt 262144) {
+        Move-Item -LiteralPath $errFile -Destination ($errFile + '.old') -Force -ErrorAction SilentlyContinue
+      }
+    }
+    ("{0} {1}" -f (Get-Date -Format o), $msg) | Out-File -LiteralPath $errFile -Encoding UTF8 -Append
+  } catch { }
+}
+try { Write-TrayLog ("start pid=$PID port=$Port") } catch { }
+
 # 只允许一个托盘图标：已经有活着的托盘进程就直接退出。
 # 服务端那边有 10 秒冷却，但旧进程残留、或两个实例同时起时，还需要这层兜底。
 try {
@@ -68,8 +82,14 @@ try {
     try {
       Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/ui/activate" -Method Post -ContentType 'application/json' -Body '{}' -TimeoutSec 8 | Out-Null
       $ok = $true
-    } catch { }
-    if (-not $ok) { Start-Process $Url }
+    } catch {
+      Write-TrayLog ("activate failed: {0}: {1}" -f $_.Exception.GetType().Name, $_.Exception.Message)
+    }
+    if (-not $ok) {
+      try { Start-Process $Url } catch {
+        Write-TrayLog ("open browser failed: {0}: {1}" -f $_.Exception.GetType().Name, $_.Exception.Message)
+      }
+    }
   }
 
   $open.add_Click($showUI)
@@ -93,9 +113,18 @@ try {
   $timer.add_Tick({
     try {
       Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/stats" -TimeoutSec 3 | Out-Null
+      if ($script:probeFails -gt 0) {
+        Write-TrayLog ("probe recovered after {0} failure(s)" -f $script:probeFails)
+      }
+      $script:probeFails = 0
     } catch {
-      $icon.Visible = $false
-      $form.Close()
+      $script:probeFails++
+      Write-TrayLog ("probe fail #{0}: {1}: {2}" -f $script:probeFails, $_.Exception.GetType().Name, $_.Exception.Message)
+      if ($script:probeFails -ge 3) {
+        Write-TrayLog 'probe failed 3 times, exiting'
+        $icon.Visible = $false
+        $form.Close()
+      }
     }
   })
   $timer.Start()
@@ -105,8 +134,7 @@ try {
   [System.Windows.Forms.Application]::Run($form)
 } catch {
   try {
-    $msg = "$(Get-Date -Format o) $($_.Exception.GetType().Name): $($_.Exception.Message)"
-    $msg | Out-File -FilePath $errFile -Encoding UTF8 -Append
+    Write-TrayLog ("fatal: {0}: {1}" -f $_.Exception.GetType().Name, $_.Exception.Message)
   } catch { }
 } finally {
   try { if ($icon) { $icon.Visible = $false; $icon.Dispose() } } catch { }

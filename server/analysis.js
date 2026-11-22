@@ -45,10 +45,17 @@ function profileAggFromRows(rows) {
   return { n: rows.length, lenSum, shortN, nightN, uniq: uniq.size };
 }
 
-// 同一条件重复检索很常见（改房间/翻回来看）；结果缓存 60 秒，避免每次都全表扫。
-const SEARCH_CACHE_TTL = 60 * 1000;
-const SEARCH_CACHE_MAX = 100;
+// 同一条件重复检索很常见（改房间/翻回来看）；结果缓存 10 分钟，避免每次都全表扫。
+// 代价是刚发的弹幕最多 10 分钟才进检索结果；导入/清理会主动清空，点「检索」不会清。
+const SEARCH_CACHE_TTL = 10 * 60 * 1000;
+const SEARCH_CACHE_MAX = 300;
 const SEARCH_CACHE = new Map();
+
+// 画像整页按 uid 缓存 60 秒：100k 条的重用户一次要 1 秒，热页面不必重复算。
+// fresh=1 绕过缓存并写回；导入/清理时整表失效。
+const PROFILE_CACHE_TTL = 60 * 1000;
+const PROFILE_CACHE_MAX = 50;
+const PROFILE_CACHE = new Map();
 
 /** 把候选词修干净：剥边、去伪词、去功能词。返回 '' 表示丢弃。 */
 function cleanTerm(raw) {
@@ -723,4 +730,32 @@ function profile(store, uid, opts = {}) {
   };
 }
 
-module.exports = { search, profile, keywords };
+/**
+ * 带缓存的画像读取。默认 60 秒内同一 uid 直接复用；fresh=true 强制重算。
+ * 只缓存成功结果；错误不缓存，避免把「刚导入还没数据」钉住一分钟。
+ */
+function profileCached(store, uid, opts = {}) {
+  const id = String(uid || '').trim();
+  if (!id) return { ok: false, error: '缺少用户 id' };
+  if (!opts.fresh) {
+    const hit = PROFILE_CACHE.get(id);
+    if (hit && Date.now() - hit.at < PROFILE_CACHE_TTL) return hit.value;
+    if (hit) PROFILE_CACHE.delete(id);
+  }
+  const value = profile(store, id, opts);
+  if (value && value.ok) {
+    if (PROFILE_CACHE.size >= PROFILE_CACHE_MAX) {
+      PROFILE_CACHE.delete(PROFILE_CACHE.keys().next().value);
+    }
+    PROFILE_CACHE.set(id, { at: Date.now(), value });
+  }
+  return value;
+}
+
+/** 导入/清理后让检索与画像缓存同时失效，避免读旧结果。 */
+function clearCaches() {
+  SEARCH_CACHE.clear();
+  PROFILE_CACHE.clear();
+}
+
+module.exports = { search, profile, profileCached, clearCaches, keywords };
