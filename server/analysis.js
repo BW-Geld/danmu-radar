@@ -471,6 +471,13 @@ function profile(store, uid, opts = {}) {
   const totals = store.userTotals(id);
   const msgs = store.userMessages(id, { limit: 5000 });
   if (!msgs.length) return { ok: false, error: '本地没有该用户的弹幕记录', empty: true };
+  const nameHistory = store.userNames(id, 12).map((r) => ({
+    nn: String(r.nn || ''),
+    n: Number(r.n) || 0,
+    first: Number(r.first) || 0,
+    last: Number(r.last) || 0,
+  }));
+  const currentName = store.latestName(id) || (nameHistory[0] && nameHistory[0].nn) || '';
 
   const rooms = store.userRoomBreakdown(id);
   const badges = store.userBadges(id);
@@ -589,7 +596,11 @@ function profile(store, uid, opts = {}) {
   return {
     ok: true,
     uid: id,
-    names: [...new Set(msgs.map((m) => m.nn).filter(Boolean))].slice(0, 5),
+    currentName,
+    nameHistory,
+    names: [currentName, ...nameHistory.map((x) => x.nn).filter((nn) => nn && nn !== currentName)]
+      .filter(Boolean)
+      .slice(0, 5),
     range: { first: Number(totals.first), last: Number(totals.last), spanDays, days },
     total,
     stats: {
