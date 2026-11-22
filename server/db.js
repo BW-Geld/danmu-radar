@@ -392,6 +392,24 @@ class Store {
     // 排行榜说法聚合一次约 1 秒；60 秒内复用，手动刷新可绕过。
     this._phraseCache = new Map();
     this._affixBusy = false;
+    // 画像全量聚合依赖两个自定义函数（Node 的 normalize / JS 的 length 口径）。
+    // 注册失败时不要硬算：analysis.profile 会整条回退到 Node 全量。
+    this.profileSql = false;
+    try {
+      this.db.function('normalize_text', { deterministic: true }, (value) => normalize(value));
+      this.db.function('js_length', { deterministic: true }, (value) =>
+        String(value == null ? '' : value).length
+      );
+      const probe = this.db
+        .prepare("SELECT js_length('😅') AS len, normalize_text('哈哈！') AS norm")
+        .get();
+      if (Number(probe.len) !== 2 || String(probe.norm) !== '哈哈') {
+        throw new Error('自定义函数自测不通过');
+      }
+      this.profileSql = true;
+    } catch (err) {
+      console.warn(`[画像] SQL 归一化函数不可用，改为 Node 全量兜底：${err.message}`);
+    }
   }
 
   /** 导入/清理后让下一次 stats() 重新统计，避免缓存显示旧数字。 */
@@ -1791,6 +1809,52 @@ class Store {
          FROM messages WHERE uid = ? AND kind = 'chat'`
       )
       .get(String(uid));
+  }
+
+  /**
+   * 画像的全量聚合（一次扫描）：条数、长度和、短文本数、夜间数、归一化去重数。
+   * 长度用 js_length（String#length，UTF-16 码元）和旧画像的 m.txt.length 对齐；
+   * 夜间用 SQLite localtime 取小时，与 Node getHours() 在同一时区。
+   */
+  userProfileAgg(uid) {
+    if (!this.profileSql) return null;
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS n,
+                SUM(js_length(txt)) AS len_sum,
+                SUM(CASE WHEN js_length(txt) <= 3 THEN 1 ELSE 0 END) AS short_n,
+                SUM(CASE WHEN CAST(strftime('%H', cst / 1000, 'unixepoch', 'localtime') AS INTEGER) < 6
+                         THEN 1 ELSE 0 END) AS night_n,
+                COUNT(DISTINCT normalize_text(txt)) AS uniq
+           FROM messages WHERE uid = ? AND kind = 'chat'`
+      )
+      .get(String(uid));
+    return {
+      n: Number(row.n) || 0,
+      lenSum: Number(row.len_sum) || 0,
+      shortN: Number(row.short_n) || 0,
+      nightN: Number(row.night_n) || 0,
+      uniq: Number(row.uniq) || 0,
+    };
+  }
+
+  /** 最近 N 条 chat（倒序）；画像的 recent/sample/文本指标都从这里切。 */
+  userRecent(uid, limit = 50) {
+    const n = Math.max(1, Math.min(Number(limit) || 50, 5000));
+    return this.db
+      .prepare(
+        `SELECT id, rid, room_name, uid, nn, txt, cst, level, bnn, bl, brid, kind, source, topic
+           FROM messages WHERE uid = ? AND kind = 'chat'
+          ORDER BY cst DESC, id DESC LIMIT ?`
+      )
+      .all(String(uid), n);
+  }
+
+  /** Node 全量兜底用：只取算指标需要的两列。 */
+  userProfileRows(uid) {
+    return this.db
+      .prepare("SELECT txt, cst FROM messages WHERE uid = ? AND kind = 'chat'")
+      .all(String(uid));
   }
 
   userRoomBreakdown(uid, limit = 12) {

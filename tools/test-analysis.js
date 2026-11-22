@@ -11,6 +11,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { Store } = require('../server/db');
 const analysis = require('../server/analysis');
+const { normalize } = require('../server/text');
 
 const DB = path.join(__dirname, '..', 'data', 'test-analysis.db');
 for (const f of [DB, DB + '-wal', DB + '-shm']) if (fs.existsSync(f)) fs.unlinkSync(f);
@@ -114,6 +115,52 @@ check('复读机样本可画像', bot.ok, `${bot.total} 条`);
 check('识别出复读/机器化标签', bot.labels.some((l) => ['repeat', 'bot'].includes(l.key)), bot.labels.map((l) => l.label).join('/'));
 check('重复率高', bot.stats.repeatRatio > 0.5, `repeatRatio=${bot.stats.repeatRatio}`);
 check('机器化评分偏高', bot.scores.bot >= 50, `bot=${bot.scores.bot}`);
+
+// 画像全量口径：SQL 聚合必须和 Node 逐条重算一致
+const botRows = store.userProfileRows('888888');
+let lenSum = 0;
+let shortN = 0;
+const uniq = new Set();
+for (const m of botRows) {
+  const txt = String(m.txt == null ? '' : m.txt);
+  lenSum += txt.length;
+  if (txt.length <= 3) shortN++;
+  uniq.add(normalize(txt));
+}
+check(
+  '画像 uniqueRatio / avgLen / shortRatio 与 Node 全量一致',
+  Math.abs(bot.stats.uniqueRatio - uniq.size / botRows.length) < 0.001 &&
+    Math.abs(bot.stats.avgLen - lenSum / botRows.length) < 0.1 &&
+    Math.abs(bot.stats.shortRatio - shortN / botRows.length) < 0.001,
+  `unique=${bot.stats.uniqueRatio} avgLen=${bot.stats.avgLen} short=${bot.stats.shortRatio}`
+);
+check(
+  '画像带 stats.basis 且默认走 SQL',
+  !!bot.stats.basis && bot.stats.basis.impl === 'sql' && bot.stats.basis.sampleN === Math.min(bot.total, 2000),
+  JSON.stringify(bot.stats.basis)
+);
+check(
+  '画像 recent[0] 是最近一条',
+  !!bot.recent[0] && bot.recent[0].cst === store.db.prepare("SELECT MAX(cst) AS c FROM messages WHERE uid='888888' AND kind='chat'").get().c,
+  bot.recent[0] && String(bot.recent[0].cst)
+);
+if (store.profileSql) {
+  const emoji = store.db.prepare("SELECT js_length('😅') AS a, js_length('😅😅') AS b").get();
+  check('js_length 按 JS UTF-16 码元计数', Number(emoji.a) === 2 && Number(emoji.b) === 4, JSON.stringify(emoji));
+}
+const savedSql = store.profileSql;
+store.profileSql = false;
+const fallbackBot = analysis.profile(store, '888888');
+store.profileSql = savedSql;
+check(
+  'SQL 不可用时整条 Node 兜底且数字一致',
+  fallbackBot.stats.basis.impl === 'node-fallback' &&
+    fallbackBot.stats.uniqueRatio === bot.stats.uniqueRatio &&
+    fallbackBot.stats.avgLen === bot.stats.avgLen &&
+    fallbackBot.stats.shortRatio === bot.stats.shortRatio &&
+    fallbackBot.stats.nightRatio === bot.stats.nightRatio,
+  JSON.stringify({ impl: fallbackBot.stats.basis.impl, unique: fallbackBot.stats.uniqueRatio })
+);
 
 const agg = analysis.profile(store, '777777');
 check('节奏号被识别', agg.labels.some((l) => l.key === 'toxic'), agg.labels.map((l) => l.label).join('/'));

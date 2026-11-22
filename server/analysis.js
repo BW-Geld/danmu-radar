@@ -24,6 +24,27 @@ const STOP_TERMS = new Set(
 const clamp = (v, lo = 0, hi = 100) => Math.max(lo, Math.min(hi, v));
 const pct = (v) => Math.round(v * 100);
 
+/** 画像：这些指标只取最近 N 条文本样本，其余（条数/长度/夜间/去重）走全量。 */
+const PROFILE_TEXT_SAMPLE = 2000;
+const PROFILE_RECENT = 50;
+const PROFILE_SAMPLE = 20;
+
+/** db.function 注册失败时的整条全量兜底；口径必须和 SQL 版逐项一致。 */
+function profileAggFromRows(rows) {
+  let lenSum = 0;
+  let shortN = 0;
+  let nightN = 0;
+  const uniq = new Set();
+  for (const m of rows) {
+    const txt = String(m.txt == null ? '' : m.txt);
+    lenSum += txt.length;
+    if (txt.length <= 3) shortN++;
+    if (new Date(Number(m.cst)).getHours() < 6) nightN++;
+    uniq.add(normalize(txt));
+  }
+  return { n: rows.length, lenSum, shortN, nightN, uniq: uniq.size };
+}
+
 // 同一条件重复检索很常见（改房间/翻回来看）；结果缓存 60 秒，避免每次都全表扫。
 const SEARCH_CACHE_TTL = 60 * 1000;
 const SEARCH_CACHE_MAX = 100;
@@ -469,8 +490,28 @@ function profile(store, uid, opts = {}) {
   if (!id) return { ok: false, error: '缺少用户 id' };
 
   const totals = store.userTotals(id);
-  const msgs = store.userMessages(id, { limit: 5000 });
-  if (!msgs.length) return { ok: false, error: '本地没有该用户的弹幕记录', empty: true };
+  let agg = null;
+  let aggImpl = 'sql';
+  try {
+    agg = store.userProfileAgg(id);
+  } catch {
+    agg = null;
+  }
+  if (!agg) {
+    agg = profileAggFromRows(store.userProfileRows(id));
+    aggImpl = 'node-fallback';
+  }
+  const total = Number(agg.n) || 0;
+  if (!total) return { ok: false, error: '本地没有该用户的弹幕记录', empty: true };
+
+  // 最近 2,000 条文本样本（倒序）。recent 50 / sample 20 都从这份切，避免三次扫表。
+  const recentRows = store.userRecent(id, PROFILE_TEXT_SAMPLE);
+  if (!recentRows.length) return { ok: false, error: '本地没有该用户的弹幕记录', empty: true };
+  // 文本指标和 intervalCv 需要时间正序；recent 列表保持倒序。
+  const msgs = recentRows.slice().reverse();
+  const sampleN = msgs.length;
+  const recentMsgs = recentRows.slice(0, PROFILE_RECENT);
+  const sampleMsgs = recentRows.slice(0, PROFILE_SAMPLE).reverse();
   const nameHistory = store.userNames(id, 12).map((r) => ({
     nn: String(r.nn || ''),
     n: Number(r.n) || 0,
@@ -484,33 +525,36 @@ function profile(store, uid, opts = {}) {
   const topTexts = store.userTopTexts(id);
   const gifts = store.userGifts(id);
 
-  const total = Number(totals.total) || msgs.length;
   const days = Number(totals.days) || 1;
   const spanDays = Math.max(1, Math.round((Number(totals.last) - Number(totals.first)) / 86400000) + 1);
   const perDay = total / Math.max(1, days);
 
   const hourly = new Array(24).fill(0);
   const textCount = new Map();
-  let shortN = 0;
-  let lenSum = 0;
   let entSum = 0;
   for (const m of msgs) {
     const d = new Date(Number(m.cst));
     hourly[d.getHours()]++;
-    lenSum += m.txt.length;
-    if (m.txt.length <= 3) shortN++;
     entSum += entropy(normalize(m.txt));
     const k = normalize(m.txt);
     textCount.set(k, (textCount.get(k) || 0) + 1);
   }
-  const avgLen = lenSum / msgs.length;
-  const uniqueRatio = textCount.size / msgs.length;
+  const avgLen = agg.lenSum / total;
+  const uniqueRatio = agg.uniq / total;
   const repeatRatio = 1 - uniqueRatio;
-  const shortRatio = shortN / msgs.length;
-  const nightN = hourly.slice(0, 6).reduce((a, b) => a + b, 0);
-  const nightRatio = nightN / msgs.length;
-  const avgEnt = entSum / msgs.length;
+  const shortRatio = agg.shortN / total;
+  const nightN = agg.nightN;
+  const nightRatio = nightN / total;
+  const avgEnt = sampleN ? entSum / sampleN : 0;
 
+  // 画像图要的是「全量」：上面的 hourly 只覆盖最近 2,000 条文本样本，别拿它冒充全量。
+  const hourlyAll = new Array(24).fill(0);
+  for (const row of store.userHourly(id)) {
+    const h = Number(row.h);
+    if (h >= 0 && h < 24) hourlyAll[h] = Number(row.n) || 0;
+  }
+
+  const roomsCount = Number(totals.rooms) || rooms.length;
   const topRoomShare = rooms.length ? Number(rooms[0].n) / total : 0;
   const hhi = rooms.reduce((s, r) => s + Math.pow(Number(r.n) / total, 2), 0);
 
@@ -540,9 +584,9 @@ function profile(store, uid, opts = {}) {
   const rhythmMsgs = msgs.filter((m) => !directMsgs.includes(m) && isRhythm(m.txt));
   const aggMsgs = directMsgs.concat(rhythmMsgs);
   const lotteryMsgs = msgs.filter((m) => /抽奖|白嫖|中奖|欧皇|非酋|福利/.test(m.txt));
-  const adRatio = adMsgs.length / total;
-  const aggRatio = directMsgs.length / total;
-  const rhythmRatio = rhythmMsgs.length / total;
+  const adRatio = adMsgs.length / sampleN;
+  const aggRatio = directMsgs.length / sampleN;
+  const rhythmRatio = rhythmMsgs.length / sampleN;
 
   const topBadge = badges[0];
   const badgeMatch = topBadge && rooms[0] && Number(topBadge.brid) === Number(rooms[0].rid);
@@ -550,9 +594,9 @@ function profile(store, uid, opts = {}) {
   const scores = {
     activity: Math.round(clamp(15 * Math.log2(perDay + 1) + 20 * Math.min(1, days / 20))),
     loyalty: Math.round(clamp(100 * (0.55 * topRoomShare + 0.25 * (badgeMatch ? 1 : 0) + 0.2 * Math.min(1, spanDays / 30)))),
-    diversity: Math.round(clamp(100 * (0.55 * Math.min(1, rooms.length / 6) + 0.45 * uniqueRatio))),
-    // 骂人满格、拱火半格；样本太少时向 0 收缩（5 条里 2 条拱火不该等于「铁对立」）
-    aggression: Math.round(clamp((aggRatio * 900 + rhythmRatio * 450) * Math.min(1, total / 20))),
+    diversity: Math.round(clamp(100 * (0.55 * Math.min(1, roomsCount / 6) + 0.45 * uniqueRatio))),
+    // 骂人满格、拱火半格；文本比例用样本分母，样本太少时向 0 收缩。
+    aggression: Math.round(clamp((aggRatio * 900 + rhythmRatio * 450) * Math.min(1, sampleN / 20))),
     bot: Math.round(clamp(100 * (0.4 * repeatRatio + 0.22 * shortRatio + 0.22 * (1 - Math.min(1, avgEnt / 3)) + 0.16 * (1 - Math.min(1, cv))))),
     spend: Math.round(clamp(gifts > 0 ? 25 + 12 * Math.log2(gifts + 1) : 0)),
   };
@@ -578,8 +622,8 @@ function profile(store, uid, opts = {}) {
   if (total < 30) add('thin', fill(COPY.NOTE.thin, { n: 30 }), 30, msgs.slice(-3));
   if (topRoomShare >= 0.6 && total >= 30)
     add('loyal', `在「${rooms[0].room_name || rooms[0].rid}」发言占 ${pct(topRoomShare)}%`, topRoomShare * 100, msgs.slice(-3));
-  if (rooms.length >= 5 && topRoomShare < 0.45)
-    add('roam', fill(T.spread, { n: rooms.length }), 70, msgs.slice(-3));
+  if (roomsCount >= 5 && topRoomShare < 0.45)
+    add('roam', fill(T.spread, { n: roomsCount }), 70, msgs.slice(-3));
   if (repeatRatio >= 0.5 && total >= 20 && scores.aggression < 50)
     add('repeat', fill(T.repeat, { n: Math.round(total * repeatRatio), pct: pct(repeatRatio) }), repeatRatio * 100,
       msgs.filter((m) => (textCount.get(normalize(m.txt)) || 0) > 1).slice(-3));
@@ -610,11 +654,18 @@ function profile(store, uid, opts = {}) {
       repeatRatio: Number(repeatRatio.toFixed(3)),
       shortRatio: Number(shortRatio.toFixed(3)),
       nightRatio: Number(nightRatio.toFixed(3)),
-      rooms: rooms.length,
+      rooms: roomsCount,
       hhi: Number(hhi.toFixed(3)),
       gifts,
       maxLevel: Number(totals.max_level) || 0,
       intervalCv: Number(cv.toFixed(2)),
+      basis: {
+        kind: 'chat',
+        sampleN,
+        sampleMode: 'recent',
+        impl: aggImpl,
+        full: ['total', 'avgLen', 'shortRatio', 'nightRatio', 'uniqueRatio', 'repeatRatio', 'rooms'],
+      },
     },
     coverage: {
       spanHours: Number((cov.spanMs / 3600000).toFixed(2)),
@@ -635,6 +686,7 @@ function profile(store, uid, opts = {}) {
     rooms: rooms.map((r) => ({ rid: r.rid, name: r.room_name, n: Number(r.n), share: Number((Number(r.n) / total).toFixed(3)) })),
     badges: badges.map((b) => ({ name: b.bnn, level: b.bl, rid: b.brid, n: Number(b.n) })),
     hourly,
+    hourlyAll,
     topics,
     flood: { total: flood.total, inFlood: flood.inFlood, share: Number((flood.share || 0).toFixed(3)) },
     // 对立倾向拆开给：直接骂人多少条、拱火带节奏多少条，避免把「龙美」这类
@@ -658,7 +710,7 @@ function profile(store, uid, opts = {}) {
     },
     topTexts: topTexts.map((t) => ({ txt: t.txt, n: Number(t.n) })),
     // 「最近 50 条」和「最近 20 条发言」是两回事：前者给用户页的明细列表用
-    recent: msgs.slice(-50).reverse().map((m) => ({
+    recent: recentMsgs.map((m) => ({
       txt: m.txt,
       cst: m.cst,
       room: m.room_name,
@@ -667,7 +719,7 @@ function profile(store, uid, opts = {}) {
       source: m.source || 'live',
     })),
     daily: store.userDaily(uid, { days: 30 }),
-    sample: msgs.slice(-20).map((m) => ({ txt: m.txt, cst: m.cst, room: m.room_name })),
+    sample: sampleMsgs.map((m) => ({ txt: m.txt, cst: m.cst, room: m.room_name })),
   };
 }
 

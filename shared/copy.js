@@ -83,6 +83,21 @@
       plus1Hint: '「+1」= 同一种说法的跟发次数（总条数 − 1）。',
     },
 
+    /** 画像图、检索复制、时间线跳检索 */
+    PROFILE: {
+      hourTitle: '发言时段分布（全量）',
+      hourTip: '{time} · {n} 条 · 占 {pct}%',
+      hourHint: '0 点 → 23 点 · 悬停看条数和占比',
+      dayTip: '{day} · {n} 条 · 点击看当天时间线',
+      dayHint: '共 {n} 天有发言 · 最多一天 {max} 条 · 点柱子看那一天',
+      copy: '复制',
+      copyTitle: '复制这句话',
+      copied: '已复制',
+      copyFailed: '复制失败，请手动选择文本',
+      timelineOpen: '在检索里看这句',
+      basisNote: '全量：总数、均长、短文本、夜间、去重；文本类（情绪/广告/对立/节奏/标签证据）：最近 {n} 条样本',
+    },
+
     /** 填 {key} 占位符；缺失的键原样保留，方便测试发现漏填 */
     fill(tpl, vars) {
       return String(tpl == null ? '' : tpl).replace(/\{(\w+)\}/g, (all, key) =>

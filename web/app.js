@@ -1032,6 +1032,16 @@ function renderResults(d) {
     const txtLine = h('div', 'txt');
     txtLine.append(h('span', null, r.disp || r.txt));
     txtLine.append(favButton(r));
+    const copyBtn = h('button', 'copy-btn', COPY.PROFILE.copy);
+    copyBtn.title = COPY.PROFILE.copyTitle;
+    copyBtn.addEventListener('click', async (ev) => {
+      ev.stopPropagation();
+      copyBtn.disabled = true;
+      const ok = await copyPlainText(r.disp || r.txt || '');
+      copyBtn.disabled = false;
+      toast(ok ? COPY.PROFILE.copied : COPY.PROFILE.copyFailed, !ok);
+    });
+    txtLine.append(copyBtn);
     body.append(txtLine);
     body.append(
       h(
@@ -2068,6 +2078,12 @@ function renderProfile(d) {
     }
   }
   left.append(dl);
+  if (d.stats && d.stats.basis) {
+    left.append(
+      h('p', 'hint basis-note',
+        COPY.fill(COPY.PROFILE.basisNote, { n: fmtNum(d.stats.basis.sampleN) }))
+    );
+  }
   if (d.coverage && d.coverage.partial) {
     const warn = h('p', 'hint note-gap', COPY.NOTE.gap);
     warn.style.marginTop = '12px';
@@ -2101,42 +2117,39 @@ function renderProfile(d) {
   right.append(roomCard);
 
   const hourCard = h('div', 'card');
-  hourCard.append(h('h2', null, '活跃时段（按小时）'));
-  const maxH = Math.max(1, ...d.hourly);
+  hourCard.append(h('h2', null, COPY.PROFILE.hourTitle));
+  const hourlyAll = Array.isArray(d.hourlyAll) ? d.hourlyAll : d.hourly;
+  const totalAll = Number(d.total) || 0;
+  const maxH = Math.max(1, ...hourlyAll);
   const hours = h('div', 'hours');
-  d.hourly.forEach((n, i) => {
+  hourlyAll.forEach((n, i) => {
     const col = h('div', 'hbar');
     const num = h('b', null, n ? String(n) : '');
     const bar = h('i');
     bar.style.height = `${Math.max(2, (n / maxH) * 100)}%`;
-    bar.title = `${pad(i)}:00 · ${n} 条`;
+    const pct = totalAll ? (n / totalAll) * 100 : 0;
+    col.title = COPY.fill(COPY.PROFILE.hourTip, {
+      time: `${pad(i)}:00`,
+      n: fmtNum(n),
+      pct: pct.toFixed(1),
+    });
     col.append(num, bar);
-    if (n > 0) {
-      col.classList.add('clickable');
-      col.title = `${pad(i)}:00 · ${n} 条 · 点击在时间线里看这一小时`;
-      col.addEventListener('click', () => {
-        const base = dayStart(d.range.last || Date.now());
-        jumpToTimeline(base + i * 3600000, base + (i + 1) * 3600000, 0);
-      });
-    }
     hours.append(col);
   });
   hourCard.append(hours);
   const ticks = h('div', 'hours-ticks');
   for (let i = 0; i < 24; i++) {
     const t = h('span', null, pad(i));
-    t.title = `${pad(i)}:00 · ${d.hourly[i] || 0} 条`;
-    if (d.hourly[i]) {
-      t.classList.add('clickable');
-      t.addEventListener('click', () => {
-        const base = dayStart(d.range.last || Date.now());
-        jumpToTimeline(base + i * 3600000, base + (i + 1) * 3600000, 0);
-      });
-    }
+    const pct = totalAll ? ((hourlyAll[i] || 0) / totalAll) * 100 : 0;
+    t.title = COPY.fill(COPY.PROFILE.hourTip, {
+      time: `${pad(i)}:00`,
+      n: fmtNum(hourlyAll[i] || 0),
+      pct: pct.toFixed(1),
+    });
     ticks.append(t);
   }
   hourCard.append(ticks);
-  hourCard.append(h('div', 'muted small', '0 点 → 23 点 · 点柱子看那一小时'));
+  hourCard.append(h('div', 'muted small', COPY.PROFILE.hourHint));
   right.append(hourCard);
 
   const topicCard = h('div', 'card');
@@ -2196,22 +2209,23 @@ function renderProfile(d) {
     dayCard.append(line);
   } else {
     const maxD = Math.max(1, ...days.map((x) => x.n));
-    const wrap = h('div', 'daybars');
+    const scroll = h('div', 'day-scroll');
+    const wrap = h('div', 'daybars' + (days.length < 12 ? ' sparse' : ''));
     for (const x of days) {
-      const col = h('div', 'daybar');
+      const col = h('div', 'daycol');
+      const barBox = h('div', 'daybar');
       const bar = h('i');
       bar.style.height = `${Math.max(2, (x.n / maxD) * 100)}%`;
-      col.title = `${x.day} · ${x.n} 条 · 点击在时间线里看这一天`;
-      col.append(bar);
+      barBox.append(bar);
+      const date = h('span', 'day-date', x.day.slice(5));
+      col.title = COPY.fill(COPY.PROFILE.dayTip, { day: x.day, n: fmtNum(x.n) });
+      col.append(barBox, date);
       col.addEventListener('click', () => openDay(x.day));
       wrap.append(col);
     }
-    dayCard.append(wrap);
-    const axis = h('div', 'dayaxis');
-    axis.append(h('span', null, days[0].day.slice(5)));
-    axis.append(h('span', null, days[days.length - 1].day.slice(5)));
-    dayCard.append(axis);
-    dayCard.append(h('p', 'muted small', `共 ${days.length} 天有发言 · 最多一天 ${fmtNum(maxD)} 条 · 点柱子看那一天`));
+    scroll.append(wrap);
+    dayCard.append(scroll);
+    dayCard.append(h('p', 'muted small', COPY.fill(COPY.PROFILE.dayHint, { n: days.length, max: fmtNum(maxD) })));
   }
   box.append(dayCard);
 
@@ -2648,13 +2662,13 @@ function renderFavorites() {
     row.append(main);
 
     const actions = h('div', 'fav-actions');
-    const copy = h('button', 'btn ghost tiny', '复制');
-    copy.title = '复制这句话';
+    const copy = h('button', 'btn ghost tiny', COPY.PROFILE.copy);
+    copy.title = COPY.PROFILE.copyTitle;
     copy.addEventListener('click', async () => {
       copy.disabled = true;
       const ok = await copyPlainText(it.txt || it.stem || '');
       copy.disabled = false;
-      toast(ok ? '已复制' : '复制失败，请手动选择文本', !ok);
+      toast(ok ? COPY.PROFILE.copied : COPY.PROFILE.copyFailed, !ok);
     });
     const del = h('button', 'btn ghost tiny', '取消收藏');
     del.addEventListener('click', async () => {
@@ -3338,17 +3352,28 @@ function renderTimelineRows(d, range) {
     who.append(h('div', 'nn', `×${fmtNum(r.n)} 条`));
     who.append(h('div', 'meta', `${fmtNum(r.users)} 人`));
     const body = h('div', 'body');
-    body.append(h('div', 'txt', r.disp || r.sample || r.phrase));
-    const why = h('div', 'why');
-    why.append(h('span', 'tag', `首次 ${fmtTime(r.first)}`));
-    if (r.plusOne) why.append(h('span', 'tag', `被 +1 ${fmtNum(r.plusOne)} 次`));
-    const go = h('button', 'origin-btn', '在检索里看');
-    go.addEventListener('click', () => {
+    const txt = h('div', 'txt txt-open', r.disp || r.sample || r.phrase);
+    txt.tabIndex = 0;
+    txt.setAttribute('role', 'button');
+    txt.title = COPY.PROFILE.timelineOpen;
+    const openInSearch = () => {
+      const sel = window.getSelection && window.getSelection();
+      if (sel && !sel.isCollapsed && txt.contains(sel.anchorNode)) return;
       $('#q').value = r.phrase;
       switchTab('search');
       runSearch();
+    };
+    txt.addEventListener('click', openInSearch);
+    txt.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter' || ev.key === ' ') {
+        ev.preventDefault();
+        openInSearch();
+      }
     });
-    why.append(go);
+    body.append(txt);
+    const why = h('div', 'why');
+    why.append(h('span', 'tag', `首次 ${fmtTime(r.first)}`));
+    if (r.plusOne) why.append(h('span', 'tag', `被 +1 ${fmtNum(r.plusOne)} 次`));
     const star = favButton({
       rid: Number($('#t-rid').value) || 0,
       stem: r.stem || r.phrase,
