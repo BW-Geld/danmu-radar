@@ -124,7 +124,7 @@ function build() {
       for (const e of fs.readdirSync(rescue, { withFileTypes: true })) {
         const from = path.join(rescue, e.name);
         const to = path.join(dataOut, e.name);
-        if (e.isDirectory()) fs.cpSync(from, to, { recursive: true });
+        if (e.isDirectory()) copyDir(from, to);
         else fs.copyFileSync(from, to);
       }
       fs.rmSync(rescue, { recursive: true, force: true });
@@ -204,17 +204,40 @@ function zip(dir) {
   archiveOldZips();
   const target = path.join(DIST, ZIP_NAME);
   fs.rmSync(target, { force: true });
-  execFileSync(
-    'powershell',
-    [
-      '-NoProfile',
-      '-Command',
-      `Compress-Archive -Path "${dir}" -DestinationPath "${target}" -CompressionLevel Optimal`,
-    ],
-    { stdio: 'inherit' }
-  );
+
+  // zip 里绝不能带 data/：那是用户库、日志和浏览器 profile。
+  // 暂存到项目根，压缩时只放一个空 data\.keep，压完再原样放回。
+  const dataDir = path.join(dir, 'data');
+  const rescue = path.join(ROOT, '.dist-data-zip-rescue');
+  let hadData = false;
+  try {
+    if (fs.existsSync(dataDir)) {
+      fs.rmSync(rescue, { recursive: true, force: true });
+      fs.renameSync(dataDir, rescue);
+      hadData = true;
+    }
+    fs.mkdirSync(dataDir, { recursive: true });
+    fs.writeFileSync(path.join(dataDir, '.keep'), '');
+    execFileSync(
+      'powershell',
+      [
+        '-NoProfile',
+        '-Command',
+        `Compress-Archive -Path "${dir}" -DestinationPath "${target}" -CompressionLevel Optimal`,
+      ],
+      { stdio: 'inherit' }
+    );
+  } finally {
+    try {
+      fs.rmSync(dataDir, { recursive: true, force: true });
+      if (hadData) fs.renameSync(rescue, dataDir);
+    } catch (err) {
+      console.log(`  [!] 恢复 dist\\data 失败：${err.message}（备份还在 ${rescue}）`);
+    }
+  }
+
   const mb = (fs.statSync(target).size / 1048576).toFixed(1);
-  console.log(`已压缩 ${target}（${mb} MB，v${VERSION}）`);
+  console.log(`已压缩 ${target}（${mb} MB，v${VERSION}，已排除 data/）`);
   return target;
 }
 
