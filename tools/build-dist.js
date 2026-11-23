@@ -3,8 +3,9 @@
 /**
  * 打包便携版：node.exe + 代码 + 启动脚本 + 说明，解压即用，不用装 Node。
  *
- *   node tools/build-dist.js            生成 dist/弹幕雷达-便携版/
- *   node tools/build-dist.js --zip      再压成 zip
+ *   node tools/build-dist.js --stage    只生成 .tmp/build-v<版本>/ 里的 staging
+ *   node tools/build-dist.js            生成 staging 并同步 dist/弹幕雷达-便携版/
+ *   node tools/build-dist.js --zip      同步后再压成 dist/danmu-radar-portable-v<版本>.zip
  */
 
 const fs = require('node:fs');
@@ -26,6 +27,10 @@ if (!/^\d+\.\d+\.\d+$/.test(VERSION)) {
   throw new Error(`VERSION 内容不合法：${VERSION}（应形如 0.3.1）`);
 }
 const ZIP_NAME = `danmu-radar-portable-v${VERSION}.zip`;
+// 构建先在 .tmp 里从零组装，绝不碰 dist 里的 live data。
+const STAGE_ROOT = path.join(ROOT, '.tmp', `build-v${VERSION}`);
+const STAGE_PKG = path.join(STAGE_ROOT, NAME);
+const CHECKER = path.join(ROOT, 'tools', 'check-package.js');
 
 const START_BAT = `@echo off
 cd /d "%~dp0"
@@ -78,83 +83,56 @@ function writeCRLF(file, text) {
   fs.writeFileSync(file, '\uFEFF' + body, 'utf8');
 }
 
-function build() {
-  // 便携版里的 data/ 是用户的库和设置，重打不能连它一起删：
-  // 先把整个 data 目录挪走，构建完再放回去（找不到就当没有）。
-  const dataDir = path.join(OUT, 'data');
-  const rescue = path.join(ROOT, '.dist-data-rescue');
-  let hadData = false;
-  try {
-    if (fs.existsSync(dataDir)) {
-      fs.rmSync(rescue, { recursive: true, force: true });
-      fs.renameSync(dataDir, rescue);
-      hadData = true;
-    }
-  } catch (err) {
-    // 绝对不能“跳过保留”继续构建：下面会 rmSync(OUT)，真的会把用户的数据库删掉。
-    throw new Error(`没法暂存 dist\\data（${err.message}）；请先停止正在运行的服务再打包，避免删除用户数据库`);
-  }
+function psQuote(s) {
+  return `'${String(s).replace(/'/g, "''")}'`;
+}
 
-  fs.rmSync(OUT, { recursive: true, force: true });
-  fs.mkdirSync(OUT, { recursive: true });
+function build() {
+  // 从零建 staging：只放源码、运行时和空 data/.keep。
+  // 不碰 dist\弹幕雷达-便携版\data，所以 7788 在跑也能安全组装。
+  fs.rmSync(STAGE_ROOT, { recursive: true, force: true });
+  fs.mkdirSync(STAGE_PKG, { recursive: true });
 
   // 引擎单独放 runtime\，根目录只留用户该点的东西（避免有人去双击 node.exe）
   const nodeExe = process.execPath;
-  fs.mkdirSync(path.join(OUT, 'runtime'), { recursive: true });
-  fs.copyFileSync(nodeExe, path.join(OUT, 'runtime', 'node.exe'));
+  fs.mkdirSync(path.join(STAGE_PKG, 'runtime'), { recursive: true });
+  fs.copyFileSync(nodeExe, path.join(STAGE_PKG, 'runtime', 'node.exe'));
 
-  copyDir(path.join(ROOT, 'server'), path.join(OUT, 'server'));
-  copyDir(path.join(ROOT, 'web'), path.join(OUT, 'web'));
-  copyDir(path.join(ROOT, 'shared'), path.join(OUT, 'shared'));
+  copyDir(path.join(ROOT, 'server'), path.join(STAGE_PKG, 'server'));
+  copyDir(path.join(ROOT, 'web'), path.join(STAGE_PKG, 'web'));
+  copyDir(path.join(ROOT, 'shared'), path.join(STAGE_PKG, 'shared'));
 
   // 托盘脚本要跟着走，否则便携版里「缩到系统托盘」用不了
   // focus.ps1 同理：开窗口前要靠它把已有窗口提到前台
-  fs.mkdirSync(path.join(OUT, 'tools'), { recursive: true });
+  fs.mkdirSync(path.join(STAGE_PKG, 'tools'), { recursive: true });
   for (const f of ['tray.ps1', 'focus.ps1']) {
-    fs.copyFileSync(path.join(ROOT, 'tools', f), path.join(OUT, 'tools', f));
+    fs.copyFileSync(path.join(ROOT, 'tools', f), path.join(STAGE_PKG, 'tools', f));
   }
 
-  const dataOut = path.join(OUT, 'data');
-  fs.mkdirSync(dataOut, { recursive: true });
-  fs.writeFileSync(path.join(OUT, 'data', '.keep'), '');
+  fs.mkdirSync(path.join(STAGE_PKG, 'data'), { recursive: true });
+  fs.writeFileSync(path.join(STAGE_PKG, 'data', '.keep'), '');
 
-  // 把用户的库和设置放回去（有的话）
-  if (hadData) {
-    try {
-      for (const e of fs.readdirSync(rescue, { withFileTypes: true })) {
-        const from = path.join(rescue, e.name);
-        const to = path.join(dataOut, e.name);
-        if (e.isDirectory()) copyDir(from, to);
-        else fs.copyFileSync(from, to);
-      }
-      fs.rmSync(rescue, { recursive: true, force: true });
-      console.log('  已保留便携版里的 data/（数据库与设置没被覆盖）');
-    } catch (err) {
-      console.log(`  [!] 恢复 dist\\data 失败：${err.message}（备份还在 ${rescue}）`);
-    }
-  }
-
-  writeCRLF(path.join(OUT, '弹幕雷达-调试启动.bat'), START_BAT);
+  writeCRLF(path.join(STAGE_PKG, '弹幕雷达-调试启动.bat'), START_BAT);
   // 无窗口启动器：直接用仓库里的那份（UTF-16LE，wscript 才认得中文）
   // 仓库根里那个 .vbs 是「开发用」的（跑源码、数据在仓库 data\）；
-// 便携版要的是自己那份启动器，内容由 tools\launcher-portable.vbs 维护。
-const LAUNCHER_SRC = path.join(ROOT, 'tools', 'launcher-portable.vbs');
-if (fs.existsSync(LAUNCHER_SRC)) {
-  fs.copyFileSync(LAUNCHER_SRC, path.join(OUT, '弹幕雷达启动程序.vbs'));
-} else {
-  const dev = path.join(ROOT, '开发用-启动源码版.vbs');
-  if (!fs.existsSync(dev)) throw new Error('找不到启动器源文件（tools\\launcher-portable.vbs 或 开发用-启动源码版.vbs）');
-  fs.copyFileSync(dev, path.join(OUT, '弹幕雷达启动程序.vbs'));
-}
+  // 便携版要的是自己那份启动器，内容由 tools\launcher-portable.vbs 维护。
+  const LAUNCHER_SRC = path.join(ROOT, 'tools', 'launcher-portable.vbs');
+  if (fs.existsSync(LAUNCHER_SRC)) {
+    fs.copyFileSync(LAUNCHER_SRC, path.join(STAGE_PKG, '弹幕雷达启动程序.vbs'));
+  } else {
+    const dev = path.join(ROOT, '开发用-启动源码版.vbs');
+    if (!fs.existsSync(dev)) throw new Error('找不到启动器源文件（tools\\launcher-portable.vbs 或 开发用-启动源码版.vbs）');
+    fs.copyFileSync(dev, path.join(STAGE_PKG, '弹幕雷达启动程序.vbs'));
+  }
   // 图标 + 「在桌面创建快捷方式」（.vbs 本身换不了图标，只能靠快捷方式）
   // 图标收进 assets\：它是被引用的素材，不该占着根目录；ASCII 名字也更稳
-  fs.mkdirSync(path.join(OUT, 'assets'), { recursive: true });
-  fs.copyFileSync(path.join(ROOT, 'assets', 'danmu-radar.ico'), path.join(OUT, 'assets', 'danmu-radar.ico'));
+  fs.mkdirSync(path.join(STAGE_PKG, 'assets'), { recursive: true });
+  fs.copyFileSync(path.join(ROOT, 'assets', 'danmu-radar.ico'), path.join(STAGE_PKG, 'assets', 'danmu-radar.ico'));
   fs.copyFileSync(
     path.join(ROOT, '在桌面创建快捷方式.vbs'),
-    path.join(OUT, '在桌面创建快捷方式.vbs')
+    path.join(STAGE_PKG, '在桌面创建快捷方式.vbs')
   );
-  writeCRLF(path.join(OUT, '使用说明.txt'), README);
+  writeCRLF(path.join(STAGE_PKG, '使用说明.txt'), README);
 
   let files = 0;
   let bytes = 0;
@@ -167,11 +145,35 @@ if (fs.existsSync(LAUNCHER_SRC)) {
         bytes += fs.statSync(p).size;
       }
     }
-  })(OUT);
+  })(STAGE_PKG);
 
-  console.log(`已生成 ${OUT}`);
-  console.log(`  ${files} 个文件，${(bytes / 1048576).toFixed(1)} MB`);
-  return OUT;
+  console.log(`已生成 staging ${STAGE_PKG}`);
+  console.log(`  ${files} 个文件，${(bytes / 1048576).toFixed(1)} MB；data/ 只有 .keep`);
+  return STAGE_ROOT;
+}
+
+function syncToDist(stageRoot) {
+  const pkg = path.join(stageRoot, NAME);
+  fs.mkdirSync(OUT, { recursive: true });
+
+  // 只替换受管理的目录和根文件；data/ 原样留在 dist 里，绝不删除。
+  for (const dir of ['server', 'web', 'shared', 'tools', 'assets', 'runtime']) {
+    const from = path.join(pkg, dir);
+    const to = path.join(OUT, dir);
+    if (!fs.existsSync(from)) throw new Error(`staging 缺少 ${dir}/，拒绝同步 dist`);
+    fs.rmSync(to, { recursive: true, force: true });
+    copyDir(from, to);
+  }
+  for (const file of ['弹幕雷达-调试启动.bat', '弹幕雷达启动程序.vbs', '在桌面创建快捷方式.vbs', '使用说明.txt']) {
+    fs.copyFileSync(path.join(pkg, file), path.join(OUT, file));
+  }
+
+  const data = path.join(OUT, 'data');
+  fs.mkdirSync(data, { recursive: true });
+  if (fs.readdirSync(data).length === 0) {
+    fs.writeFileSync(path.join(data, '.keep'), '');
+  }
+  console.log(`已同步 ${OUT}（data/ 未动）`);
 }
 
 function archiveStamp() {
@@ -198,42 +200,29 @@ function archiveOldZips() {
   }
 }
 
-function zip(dir) {
+function zip(stageRoot) {
   // zip 的名字必须全 ASCII：GitHub 上传附件时会把文件名里的非 ASCII 字符直接删掉，
   // 「弹幕雷达-便携版.zip」会变成「-.zip」，所以包名用英文，中文写在 Release 标题里。
-  archiveOldZips();
   const target = path.join(DIST, ZIP_NAME);
-  fs.rmSync(target, { force: true });
+  const temp = path.join(ROOT, '.tmp', `${ZIP_NAME}.tmp`);
+  fs.mkdirSync(path.dirname(temp), { recursive: true });
+  fs.rmSync(temp, { force: true });
 
-  // zip 里绝不能带 data/：那是用户库、日志和浏览器 profile。
-  // 暂存到项目根，压缩时只放一个空 data\.keep，压完再原样放回。
-  const dataDir = path.join(dir, 'data');
-  const rescue = path.join(ROOT, '.dist-data-zip-rescue');
-  let hadData = false;
+  // 从 staging 压，不碰 dist\data。.NET 的 includeBaseDirectory=true 保留顶层目录。
+  const script = [
+    'Add-Type -AssemblyName System.IO.Compression.FileSystem',
+    `[IO.Compression.ZipFile]::CreateFromDirectory(${psQuote(stageRoot)}, ${psQuote(temp)}, [IO.Compression.CompressionLevel]::Optimal, $true)`,
+  ].join('; ');
   try {
-    if (fs.existsSync(dataDir)) {
-      fs.rmSync(rescue, { recursive: true, force: true });
-      fs.renameSync(dataDir, rescue);
-      hadData = true;
-    }
-    fs.mkdirSync(dataDir, { recursive: true });
-    fs.writeFileSync(path.join(dataDir, '.keep'), '');
-    execFileSync(
-      'powershell',
-      [
-        '-NoProfile',
-        '-Command',
-        `Compress-Archive -Path "${dir}" -DestinationPath "${target}" -CompressionLevel Optimal`,
-      ],
-      { stdio: 'inherit' }
-    );
-  } finally {
-    try {
-      fs.rmSync(dataDir, { recursive: true, force: true });
-      if (hadData) fs.renameSync(rescue, dataDir);
-    } catch (err) {
-      console.log(`  [!] 恢复 dist\\data 失败：${err.message}（备份还在 ${rescue}）`);
-    }
+    execFileSync('powershell', ['-NoProfile', '-Command', script], { stdio: 'inherit' });
+    // 坏包在这里直接失败，绝不进入 dist。
+    execFileSync(process.execPath, [CHECKER, temp], { stdio: 'inherit' });
+    archiveOldZips();
+    fs.rmSync(target, { force: true });
+    fs.renameSync(temp, target);
+  } catch (err) {
+    fs.rmSync(temp, { force: true });
+    throw new Error(`zip 生成或检查失败，未写入 dist：${err.message}`);
   }
 
   const mb = (fs.statSync(target).size / 1048576).toFixed(1);
@@ -241,5 +230,14 @@ function zip(dir) {
   return target;
 }
 
-const out = build();
-if (process.argv.includes('--zip')) zip(out);
+function main() {
+  const stageRoot = build();
+  if (process.argv.includes('--stage')) {
+    console.log(`  --stage：只生成 staging，不同步 dist、不压缩`);
+    return;
+  }
+  syncToDist(stageRoot);
+  if (process.argv.includes('--zip')) zip(stageRoot);
+}
+
+main();
