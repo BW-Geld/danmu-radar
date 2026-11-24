@@ -50,6 +50,9 @@ store.open();
 
 // 测试/探针用：只打印「打算怎么打开界面」，不真的拉窗口
 const DRY_RUN = process.env.DANMU_DRY === '1';
+// 临时实例（7799/包冒烟）用：不碰系统托盘，避免 killTrayProcesses() 误杀 live 的托盘
+const NO_TRAY = process.env.DANMU_NO_TRAY === '1';
+let noTrayLogged = false;
 
 // ---------------------------------------------------------------- 界面偏好
 // 时间线选区这类「应该跨窗口一致」的小状态放服务端，而不是 localStorage：
@@ -910,20 +913,34 @@ async function handleApi(req, res, url) {
 
   // 托盘图标点「打开界面」：优先把已经开着的窗口提到前台，没有才新开一个
   if (p === '/ui/activate' && req.method === 'POST') {
+    const startedAt = Date.now();
+    const reply = (how) => {
+      console.log(`[界面] activate ${how} ${Date.now() - startedAt}ms`);
+      return json(res, 200, { ok: true, how });
+    };
+    // 托盘「打开界面」必须按设置走：浏览器模式不要偷偷开独立窗口
+    if (getUISettings().windowMode === 'browser') {
+      const tab = await openBrowser({ noApp: true, force: true });
+      return reply(tab ? 'browser' : 'none');
+    }
     const pid = activeAppPid();
-    if (pid && (await focusAppWindow(pid))) {
-      ensureTray();
-      return json(res, 200, { ok: true, how: 'focused' });
+    if (pid) {
+      const exists = await probeAppWindow(pid);
+      if (exists && (await focusAppWindow(pid))) {
+        ensureTray();
+        return reply('focused');
+      }
+      if (!exists) clearAppWindowState(pid);
     }
     // 没有独立窗口，但可能已经在浏览器标签里开着（标题含「弹幕雷达」）：把它叫出来就行，
     // 不要再启动一次浏览器——提权/普通权限混用时，再启动一次会弹 Windows 的「Edge 未响应」权限提示。
     if (await focusAnyWindow()) {
       ensureTray();
-      return json(res, 200, { ok: true, how: 'tab-focused' });
+      return reply('tab-focused');
     }
-    if (await openAppWindow()) return json(res, 200, { ok: true, how: 'app' });
+    if (await openAppWindow()) return reply('app');
     const tab = await openBrowser({ noApp: true, force: true });
-    return json(res, 200, { ok: true, how: tab ? 'browser' : 'none' });
+    return reply(tab ? 'browser' : 'none');
   }
 
   // 退出：缩到托盘，或者停止采集（界面上的两选一）
@@ -951,7 +968,7 @@ async function handleApi(req, res, url) {
     const tray = ensureTray();
     // closedWindow 告诉前端：独立窗口已经被我们关掉了；false 说明用户是在浏览器标签里看的，
     // 那个标签页得他自己关（脚本没法保证 window.close() 生效）。
-    return json(res, 200, { ok: true, action: 'tray', tray: tray !== 'failed', closedWindow: hadAppWindow });
+    return json(res, 200, { ok: true, action: 'tray', tray: tray !== 'failed' && tray !== 'disabled', closedWindow: hadAppWindow });
   }
 
   // 主动停止采集并退出（界面上的「停止并退出」按钮）
@@ -1497,8 +1514,15 @@ function killTrayProcesses() {
 }
 
 function ensureTray() {
-  // 返回 'already-alive' | 'starting' | 'spawned' | 'failed'。
+  // 返回 'already-alive' | 'starting' | 'spawned' | 'failed' | 'disabled'。
   // 调用方只有拿到 'spawned' 才能说「已重新拉起」，否则会把「本来还活着」误报成重启。
+  if (NO_TRAY) {
+    if (!noTrayLogged) {
+      noTrayLogged = true;
+      console.log('[托盘] DANMU_NO_TRAY=1，跳过托盘（临时实例不碰 live 托盘）');
+    }
+    return 'disabled';
+  }
   if (trayAlive()) return 'already-alive';
   // 刚拉过、pid 文件还没落盘的这段时间，直接当作已启动，避免重复拉
   if (trayChild && !trayChild.killed) return 'starting';
@@ -1663,7 +1687,7 @@ function focusAnyWindow() {
     execFile(
       'powershell.exe',
       ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script, '-Title', '弹幕雷达'],
-      { timeout: 12000 },
+      { timeout: 3000 },
       (err, stdout) => resolve(!err && String(stdout).includes('FOCUSED'))
     );
   });
@@ -1671,9 +1695,10 @@ function focusAnyWindow() {
 
 /**
  * 把已经开着的窗口提到最前面。
- * 先按「窗口标题含 弹幕雷达」找（tools/focus.ps1，SetForegroundWindow）——
- * 白页窗口的标题是 `127.0.0.1_/`，匹配不到，正好被当成「不是好窗口」；
- * 再退回按 pid 的 AppActivate 兜底。返回是否真的提到了。
+ * 只按「窗口标题含 弹幕雷达」找（tools/focus.ps1，SetForegroundWindow）——
+ * 白页窗口的标题是 `127.0.0.1_/`，匹配不到，正好被当成「不是好窗口」。
+ * 不再退回 AppActivate(pid)：同进程的普通 Edge 窗口会被误当成独立窗口，
+ * 日志报 focused、用户却看不到面板。
  */
 function pidIsAppWindow(pid) {
   // 只看「进程活没活」会把浏览器标签页当成独立窗口：标签页标题里也有「弹幕雷达」，
@@ -1682,9 +1707,25 @@ function pidIsAppWindow(pid) {
     const { execFileSync } = require("node:child_process");
     const out = execFileSync("powershell.exe", ["-NoProfile","-NonInteractive","-Command",
       `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").CommandLine`],
-      { timeout: 6000, windowsHide: true }).toString();
+      { timeout: 2000, windowsHide: true }).toString();
     return out.includes("--app=");
   } catch { return false; }
+}
+
+/** 只检查记录里的窗口是否真的还在（不聚焦）；进程活着不等于窗口还在 */
+function probeAppWindow(pid) {
+  return new Promise((resolve) => {
+    if (!pidAlive(pid)) return resolve(false);
+    const script = path.join(ROOT, 'tools', 'focus.ps1');
+    if (!fs.existsSync(script)) return resolve(false);
+    const { execFile } = require('node:child_process');
+    execFile(
+      'powershell.exe',
+      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script, '-TargetPid', String(pid), '-Title', '弹幕雷达', '-Probe'],
+      { timeout: 3000 },
+      (err, stdout) => resolve(!err && String(stdout).includes('FOCUSED'))
+    );
+  });
 }
 
 function focusAppWindow(pid) {
@@ -1692,22 +1733,15 @@ function focusAppWindow(pid) {
   if (!pidIsAppWindow(pid)) return Promise.resolve(false);
   const { execFile } = require('node:child_process');
   const script = path.join(ROOT, 'tools', 'focus.ps1');
-  const byTitle = new Promise((resolve) => {
+  return new Promise((resolve) => {
     if (!fs.existsSync(script)) return resolve(false);
     execFile(
       'powershell.exe',
       ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script, '-TargetPid', String(pid), '-Title', '弹幕雷达'],
-      { timeout: 12000 },
+      { timeout: 3000 },
       (err, stdout) => resolve(!err && String(stdout).includes('FOCUSED'))
     );
   });
-  const byPid = () => new Promise((resolve) => {
-    const ps = `$s = New-Object -ComObject WScript.Shell; if ($s.AppActivate(${pid})) { 'FOCUSED' } else { 'MISSED' }`;
-    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { timeout: 6000 }, (err, stdout) => {
-      resolve(!err && String(stdout).includes('FOCUSED'));
-    });
-  });
-  return byTitle.then((ok) => (ok ? true : byPid()));
 }
 
 /** 找出所有命令行里带这个 profile 目录的 Edge/Chrome 进程并结束（含子进程） */
@@ -1720,7 +1754,7 @@ function closeProfileWindows(profile) {
       `Where-Object { $_.CommandLine -like '*${profile.replace(/\\/g, '\\\\')}*' } | ` +
       `ForEach-Object { $_.ProcessId }`;
     try {
-      execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { timeout: 8000 }, (err, stdout) => {
+      execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { timeout: 4000 }, (err, stdout) => {
         if (err || !stdout) return resolve(0);
         const pids = String(stdout)
           .split(/\s+/)
@@ -1896,12 +1930,18 @@ async function openAppWindow() {
     // 而且「关掉再开」的空档里浏览器还攥着配置目录，正是之前白屏的温床。
     const alive = activeAppPid();
     if (alive) {
-      if (await focusAppWindow(alive)) {
-        console.log('[界面] 窗口已经开着，已提到前台');
-        ensureTray();
-        return true;
+      const exists = await probeAppWindow(alive);
+      if (exists) {
+        if (await focusAppWindow(alive)) {
+          console.log('[界面] 窗口已经开着，已提到前台');
+          ensureTray();
+          return true;
+        }
+        console.log('[界面] 有窗口但提不到前台（权限级别不同），关掉重开');
+      } else {
+        clearAppWindowState(alive);
+        console.log('[界面] 记录的独立窗口已不在，清掉旧状态后重开');
       }
-      console.log('[界面] 有窗口但提不到前台（权限级别不同），关掉重开');
     }
     const url = `http://${HOST}:${PORT}/`;
     const cands = browserCandidates();
@@ -1932,7 +1972,7 @@ async function openAppWindow() {
         if (!p) continue;
         ensureTray();
         // 白页不会连 SSE：给它 6 秒，连不上就认作白屏，关掉换下一个
-        if (await waitForClient(before, 6000)) return true;
+        if (await waitForClient(before, 2500)) return true;
         console.log(`[界面] ${name} 的独立窗口没连上界面（白屏），关掉再试下一个浏览器。`);
         // 标记成「我们自己关的」，否则 exit 回调会把它当成用户关窗，按设置把采集也停掉
         closingAppWindowPid = p.pid;
@@ -2011,7 +2051,7 @@ function openBrowser(opts = {}) {
     const before = clients.size;
     const okExplorer = await run('explorer.exe', [`${url}/`]);
     if (!okExplorer) await run('rundll32', ['url.dll,FileProtocolHandler', `${url}/`]);
-    if (await waitForClient(before, 14000)) {
+    if (await waitForClient(before, 4000)) {
       ensureTray();
       return true;
     }
@@ -2080,6 +2120,8 @@ let lastTrayTry = 0;
 function uiMonitor() {
   const s = getUISettings();
   if (!uiAttached) return;
+  // 临时实例没有托盘，也就没有「缩到托盘」这条路径；不要在 30 秒循环里反复尝试
+  if (NO_TRAY) return;
 
   // 托盘要一直有人看着：图标可能因为脚本自己退出、系统重启资源管理器而消失，
   // 而这时候界面往往正开着（下面会因为 clients>0 提前 return），没人补。

@@ -1,7 +1,8 @@
 ﻿param(
   [int]$TargetPid = 0,
   [string]$Title = '弹幕雷达',
-  [string]$Exclude = 'Microsoft Edge|Google Chrome|Mozilla Firefox| - 个人 - '
+  [string]$Exclude = 'Microsoft Edge|Google Chrome|Mozilla Firefox| - 个人 - ',
+  [switch]$Probe
 )
 
 # 把已经开着的【独立窗口】叫到前台。
@@ -28,6 +29,8 @@ public class WinFocus {
   [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
   [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
@@ -36,6 +39,9 @@ public class WinFocus {
     string[] bad = exclude.Split('|');
     EnumWindows(delegate(IntPtr h, IntPtr l) {
       if (!IsWindowVisible(h)) return true;
+      RECT r;
+      if (!GetWindowRect(h, out r)) return true;
+      if (r.Right - r.Left < 200 || r.Bottom - r.Top < 100) return true;
       uint pid;
       GetWindowThreadProcessId(h, out pid);
       if (wantPid != 0 && pid != wantPid) return true;
@@ -57,8 +63,10 @@ try {
   if (-not ('WinFocus' -as [type])) { Add-Type -TypeDefinition $sig }
   $h = [WinFocus]::Find($Title, [uint32]$TargetPid, $Exclude)
   if ($h -ne [IntPtr]::Zero) {
-    [void][WinFocus]::ShowWindow($h, 9)   # SW_RESTORE：最小化过也能拉回来
-    [void][WinFocus]::SetForegroundWindow($h)
+    if (-not $Probe) {
+      [void][WinFocus]::ShowWindow($h, 9)   # SW_RESTORE：最小化过也能拉回来
+      [void][WinFocus]::SetForegroundWindow($h)
+    }
     'FOCUSED'
   } else {
     'MISSED'

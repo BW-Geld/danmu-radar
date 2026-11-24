@@ -76,20 +76,25 @@ try {
   $open = $menu.Items.Add('打开界面')
   $quit = $menu.Items.Add('停止采集并退出')
 
-  # 优先让服务把已有窗口提到前台；服务里那段逻辑是「有窗口就激活、没有才新开」
+  # 优先让服务把已有窗口提到前台；服务里那段逻辑是「有窗口就激活、没有才新开」。
+  # 这里必须异步：WinForms 的事件处理跑在 UI 线程上，同步 HTTP 会把菜单/图标卡住，
+  # 服务端一旦超过 8 秒，用户看到的就是「点了没反应」。
+  $script:uiJob = $null
   $showUI = {
-    $ok = $false
-    try {
-      Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/ui/activate" -Method Post -ContentType 'application/json' -Body '{}' -TimeoutSec 8 | Out-Null
-      $ok = $true
-    } catch {
-      Write-TrayLog ("activate failed: {0}: {1}" -f $_.Exception.GetType().Name, $_.Exception.Message)
-    }
-    if (-not $ok) {
-      try { Start-Process $Url } catch {
-        Write-TrayLog ("open browser failed: {0}: {1}" -f $_.Exception.GetType().Name, $_.Exception.Message)
+    if ($script:uiJob -and $script:uiJob.State -eq 'Running') { return }
+    if ($script:uiJob) { Remove-Job -Job $script:uiJob -Force -ErrorAction SilentlyContinue }
+    $script:uiJob = Start-Job -ScriptBlock {
+      param($Port, $Url, $Log)
+      try {
+        Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/ui/activate" -Method Post -ContentType 'application/json' -Body '{}' -TimeoutSec 15 | Out-Null
+      } catch {
+        try {
+          ("{0} activate failed: {1}" -f (Get-Date -Format o), $_.Exception.Message) |
+            Out-File -LiteralPath $Log -Encoding UTF8 -Append
+        } catch { }
+        try { Start-Process $Url } catch { }
       }
-    }
+    } -ArgumentList $Port, $Url, $errFile
   }
 
   $open.add_Click($showUI)
@@ -106,6 +111,8 @@ try {
   $icon.ContextMenuStrip = $menu
   # 双击图标 = 同一个动作：有窗口就提到前台，没有才开
   $icon.add_DoubleClick($showUI)
+  # 左键单击也直接打开/聚焦；双击仍保留，job 运行中会去重
+  $icon.add_Click($showUI)
 
   # 服务没了就自己退（每 5 秒探一次）
   $timer = New-Object System.Windows.Forms.Timer
