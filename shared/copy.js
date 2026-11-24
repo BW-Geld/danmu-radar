@@ -65,7 +65,7 @@
       sendersFailed: '谁在发：加载失败',
       sendersTitle: '谁在发（{n} 人）：',
       originWho: '本房间最早：{who} · ',
-      originStats: '共 {total} 条 / {users} 人 · 其中被 +1 {plusOne} 次 · 弹幕潮 {floods} 次',
+      originStats: '共 {total} 条 / {users} 人 · 其中被 +1：{plusOne} 次 · 弹幕潮 {floods} 次',
       sampleFrom: '样本取自 {who}',
       firstInRoom: '本房间最早 {date} {time}',
     },
