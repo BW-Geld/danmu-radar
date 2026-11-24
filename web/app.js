@@ -463,6 +463,8 @@ async function stopRoom(rid, forget = false) {
 function selectRoom(rid) {
   state.liveRid = rid;
   state.buffer = [];
+  liveUserMoved = false;
+  state.stick = true;
   $('#live-list').textContent = '';
   renderRooms();
   const room = state.rooms.find((r) => r.rid === rid);
@@ -526,6 +528,10 @@ function matchFilter(m) {
 
 // 是否吸附在底部：用户往上翻看历史时不抢滚动条，翻回底部自动恢复跟随
 state.stick = true;
+// 浏览器刷新会恢复 #live-list 的 scrollTop，触发 scroll 事件；如果把它当成
+// 「用户往上翻了」，state.stick 会被置 false，新弹幕就不自动跟到底。
+// 只有用户自己滚过（滚轮/触屏/滚动条/翻页键）才允许关闭吸附。
+let liveUserMoved = false;
 
 function atBottom(box) {
   return box.scrollHeight - box.scrollTop - box.clientHeight < 24;
@@ -533,15 +539,31 @@ function atBottom(box) {
 
 function updateStick() {
   const box = $('#live-list');
+  if (!liveUserMoved) {
+    state.stick = true;
+    const btn = $('#live-jump');
+    if (btn) btn.classList.remove('show');
+    return;
+  }
   state.stick = atBottom(box);
   const btn = $('#live-jump');
   if (btn) btn.classList.toggle('show', !state.stick);
 }
 
 $('#live-list').addEventListener('scroll', updateStick, { passive: true });
+$('#live-list').addEventListener('wheel', () => { liveUserMoved = true; }, { passive: true });
+$('#live-list').addEventListener('touchstart', () => { liveUserMoved = true; }, { passive: true });
+$('#live-list').addEventListener('pointerdown', (e) => {
+  // 点弹幕正文是检索，不是滚动；只有点列表空白/滚动条才进入“用户自己翻了”状态
+  if (e.target === $('#live-list')) liveUserMoved = true;
+});
+$('#live-list').addEventListener('keydown', (e) => {
+  if (['PageUp', 'PageDown', 'Home', 'End', 'ArrowUp', 'ArrowDown'].includes(e.key)) liveUserMoved = true;
+});
 
 $('#live-jump').addEventListener('click', () => {
   const box = $('#live-list');
+  liveUserMoved = false;
   state.stick = true;
   box.scrollTop = box.scrollHeight;
   updateStick();
@@ -635,7 +657,10 @@ $('#live-pause').addEventListener('change', (e) => {
   state.paused = e.target.checked;
   if (!state.paused) {
     const box = $('#live-list');
+    liveUserMoved = false;
+    state.stick = true;
     box.scrollTop = box.scrollHeight;
+    updateStick();
   }
 });
 
