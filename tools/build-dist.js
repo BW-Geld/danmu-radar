@@ -205,13 +205,19 @@ function zip(stageRoot) {
   // 「弹幕雷达-便携版.zip」会变成「-.zip」，所以包名用英文，中文写在 Release 标题里。
   const target = path.join(DIST, ZIP_NAME);
   const temp = path.join(ROOT, '.tmp', `${ZIP_NAME}.tmp`);
+  const pkgRoot = path.join(stageRoot, NAME);
+  if (!fs.existsSync(path.join(pkgRoot, 'server', 'index.js'))) {
+    throw new Error(`staging 不完整，找不到 ${path.join(pkgRoot, 'server', 'index.js')}`);
+  }
   fs.mkdirSync(path.dirname(temp), { recursive: true });
   fs.rmSync(temp, { force: true });
 
-  // 从 staging 压，不碰 dist\data。.NET 的 includeBaseDirectory=true 保留顶层目录。
+  // 从 staging 的包目录压，不碰 dist\data。.NET 的 includeBaseDirectory=true
+  // 会保留传入目录本身的顶层名；传 pkgRoot 才会得到「弹幕雷达-便携版/」这一层，
+  // 传 stageRoot 会多出「build-v<版本>/」前缀。
   const script = [
     'Add-Type -AssemblyName System.IO.Compression.FileSystem',
-    `[IO.Compression.ZipFile]::CreateFromDirectory(${psQuote(stageRoot)}, ${psQuote(temp)}, [IO.Compression.CompressionLevel]::Optimal, $true)`,
+    `[IO.Compression.ZipFile]::CreateFromDirectory(${psQuote(pkgRoot)}, ${psQuote(temp)}, [IO.Compression.CompressionLevel]::Optimal, $true)`,
   ].join('; ');
   try {
     execFileSync('powershell', ['-NoProfile', '-Command', script], { stdio: 'inherit' });
